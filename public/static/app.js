@@ -38,9 +38,14 @@ function $(sel, root) { return (root || document).querySelector(sel); }
 function $all(sel, root) { return Array.prototype.slice.call((root || document).querySelectorAll(sel)); }
 
 function renderShell() {
+  // 승인 대기 건수: 데이터가 있을 때만 배지 표시 (운영 빈 상태에서는 0)
+  var pendingCnt = DB.hasData()
+    ? DB.approvals.filter(function (a) { return a.statusKey === 'SUBMITTED'; }).length
+    : 0;
   var navHtml = NAV.map(function (n) {
     if (n.g) return '<div class="nav__group">' + n.g + '</div>';
-    var extra = n.badge ? '<span class="badge">' + n.badge + '</span>'
+    var badgeVal = (n.id === 'approval') ? pendingCnt : n.badge;
+    var extra = badgeVal ? '<span class="badge">' + badgeVal + '</span>'
       : (n.star ? '<span class="star"><i class="fas fa-star"></i></span>' : '');
     return '<div class="nav__item" data-route="' + n.id + '">'
       + '<i class="fas ' + n.icon + '"></i><span>' + n.label + '</span>' + extra + '</div>';
@@ -110,6 +115,17 @@ function alertRow(a) {
     + '<div class="ai-body"><div class="ai-title">' + a.title + '</div><div class="ai-meta">' + a.meta + '</div></div></div>';
 }
 
+/* Empty State — 운영 빌드(데이터 없음)에서 각 화면에 표시 */
+function emptyState(msg) {
+  return '<div class="empty-state">'
+    + '<div class="empty-state__ico"><i class="fas fa-database"></i></div>'
+    + '<h3 class="empty-state__title">데이터 없음</h3>'
+    + '<p class="empty-state__msg">' + (msg || '표시할 데이터가 없습니다.') + '</p>'
+    + '<div class="empty-state__tag"><i class="fas fa-plug"></i> API 연동 대기 중</div>'
+    + '<p class="empty-state__hint">운영 서버에서는 Spring Boot API(<code>/api/...</code>) 연동 후 데이터가 표시됩니다.</p>'
+    + '</div>';
+}
+
 var PAGES = {};
 var AFTER = {};
 
@@ -132,6 +148,7 @@ function top5Rows() {
 }
 
 PAGES.dashboard = function () {
+  if (!DB.hasData()) return emptyState('사전원가 현황 데이터가 아직 없습니다. SAP BW 수신 및 시뮬레이션 후 표시됩니다.');
   var totalCost = DB.trend.PM2[DB.trend.PM2.length - 1];
   var prevCost = DB.trend.PM2[DB.trend.PM2.length - 2];
   var deltaPct = ((totalCost - prevCost) / prevCost * 100);
@@ -146,7 +163,7 @@ PAGES.dashboard = function () {
     + kpiCard('톤당 원가', fmt.won(costPerTon), '원/톤', 'fa-weight-hanging', 'ico-indigo', 'delta-flat', 'fa-minus', '생산 ' + fmt.ton(DB.meta.productionTon) + '톤')
     + kpiCard('총 원가차이', fmt.wonSign(totalVar / 1000000) + 'M', '원', 'fa-scale-unbalanced', 'ico-amber',
         totalVar >= 0 ? 'delta-down' : 'delta-up', totalVar >= 0 ? 'fa-arrow-up' : 'fa-arrow-down', '물량+가격 차이')
-    + kpiCard('승인 대기', '2', '건', 'fa-hourglass-half', 'ico-red', 'delta-flat', 'fa-clock', '마감 D-3')
+    + kpiCard('승인 대기', String(DB.approvals.filter(function (a) { return a.statusKey === 'SUBMITTED'; }).length), '건', 'fa-hourglass-half', 'ico-red', 'delta-flat', 'fa-clock', '마감 D-3')
     + '</div>';
 
   var trendCard = '<div class="card"><div class="card__head"><h3>월별 사전원가 추이</h3><span class="sub">단위: 백만원</span>'
@@ -178,6 +195,7 @@ PAGES.dashboard = function () {
 };
 
 AFTER.dashboard = function () {
+  if (!DB.hasData()) return;
   var box = $('#trendBars'); if (!box) return;
   var all = DB.trend.PM2.concat(DB.trend.PM3);
   var max = Math.max.apply(null, all);
@@ -192,6 +210,7 @@ AFTER.dashboard = function () {
 
 /* ============== 사전원가 시뮬레이션 (slide 8) — PRIORITY ============== */
 PAGES.sim = function () {
+  if (!DB.hasData()) return emptyState('시뮬레이션할 자재 데이터가 없습니다. 자재 마스터 연동 후 이용할 수 있습니다.');
   var stepper = '<div class="stepper">'
     + '<div class="step done"><div class="step__dot"><i class="fas fa-check"></i></div><div class="step__lab">SAP BW 수신</div></div><div class="step__line"></div>'
     + '<div class="step done"><div class="step__dot"><i class="fas fa-check"></i></div><div class="step__lab">기준정보 확정</div></div><div class="step__line"></div>'
@@ -306,6 +325,7 @@ function simRender() {
 }
 
 AFTER.sim = function () {
+  if (!DB.hasData()) return;
   ['ton', 'defect', 'unit', 'price'].forEach(function (id) {
     var s = $('#s_' + id);
     if (s) s.addEventListener('input', simRender);
@@ -315,6 +335,7 @@ AFTER.sim = function () {
 
 /* ====================== 이동 계획 (slide 6) ====================== */
 PAGES.movement = function () {
+  if (!DB.hasData()) return emptyState('이동 계획 데이터가 없습니다. 입고·출고·이송 내역 연동 후 표시됩니다.');
   var types = ['전체', '입고', '출고', '이송', '조정', '출하', '반품'];
   var typeOpts = types.map(function (t) { return '<option>' + t + '</option>'; }).join('');
   var statusOpts = ['전체', '완료', '진행중', '예정'].map(function (s) { return '<option>' + s + '</option>'; }).join('');
@@ -370,6 +391,7 @@ function mvRender() {
 }
 
 AFTER.movement = function () {
+  if (!DB.hasData()) return;
   ['f_type', 'f_status', 'f_mat'].forEach(function (id) { var e = $('#' + id); if (e) e.addEventListener('change', mvRender); });
   var q = $('#f_q'); if (q) q.addEventListener('input', mvRender);
   mvRender();
@@ -377,6 +399,7 @@ AFTER.movement = function () {
 
 /* ====================== SAP BW 수신 (slide 3) ====================== */
 PAGES.sapsync = function () {
+  if (!DB.hasData()) return emptyState('SAP BW 수신 내역이 없습니다. SAP 연동 후 표준원단위·표준단가·생산계획이 표시됩니다.');
   var kpis = '<div class="grid g-3" style="margin-bottom:16px">'
     + kpiCard('수신 자재', DB.materials.length, '개', 'fa-cubes', 'ico-blue', 'delta-up', 'fa-check', '정상 수신')
     + kpiCard('최근 수신', '06:14', '', 'fa-clock', 'ico-indigo', 'delta-flat', 'fa-calendar', '2026-05-01')
@@ -399,6 +422,7 @@ PAGES.sapsync = function () {
 
 /* ====================== 자재 마스터 (slide) ====================== */
 PAGES.master = function () {
+  if (!DB.hasData()) return emptyState('자재 마스터 데이터가 없습니다. 기준정보 연동 후 가중평균 단가가 표시됩니다.');
   var rows = DB.materials.map(function (m) {
     var V = Calc.weightedAvgPrice(m.R, m.S, m.T, m.U);
     return '<tr><td class="cell-code">' + m.code + '</td><td><b>' + m.name + '</b></td><td>' + m.maker + '</td>'
@@ -419,6 +443,7 @@ PAGES.master = function () {
 
 /* ====================== 생산·원가 계획 (slide 5) ====================== */
 PAGES.plan = function () {
+  if (!DB.hasData()) return emptyState('생산·원가 계획 데이터가 없습니다. 계획 등록 또는 API 연동 후 표시됩니다.');
   var rows = DB.plans.map(function (p) {
     return '<tr><td class="cell-code">' + p.id + '</td><td><b>' + p.plant + '</b></td>'
       + '<td>' + tag(p.grade, 'TRANSFER') + '</td>'
@@ -437,6 +462,7 @@ PAGES.plan = function () {
 
 /* ====================== 실적 입력 (slide 7) ====================== */
 PAGES.actual = function () {
+  if (!DB.hasData()) return emptyState('실적 입력 대상 자재가 없습니다. 자재 마스터 연동 후 실적원단위를 입력할 수 있습니다.');
   var rows = DB.materials.map(function (m) {
     var diff = ((m.Q - m.L) / m.L * 100);
     return '<tr><td class="cell-code">' + m.code + '</td><td><b>' + m.name + '</b></td>'
@@ -455,6 +481,7 @@ PAGES.actual = function () {
 
 /* ====================== 승인 워크플로 (slide 10) ====================== */
 PAGES.approval = function () {
+  if (!DB.hasData()) return emptyState('승인 워크플로 데이터가 없습니다. 사전원가 상신 후 결재 현황이 표시됩니다.');
   var rows = DB.approvals.map(function (a) {
     return '<tr><td class="cell-code">' + a.id + '</td><td><b>' + a.title + '</b></td>'
       + '<td class="num">' + fmt.dec(a.amount / 1000, 2) + ' 억원</td>'
@@ -500,6 +527,7 @@ function aiAnswer(q) {
   return '원가 차이는 <b>물량차이(Y)</b>와 <b>가격차이(Z)</b>로 분해됩니다. 시뮬레이션 화면에서 변수를 조정하며 영향을 확인해 보세요. 더 궁금한 점을 질문해 주세요.';
 }
 PAGES.ai = function () {
+  if (!DB.hasData()) return emptyState('분석할 원가 데이터가 없습니다. 시뮬레이션 데이터 연동 후 AI 분석을 이용할 수 있습니다.');
   var sug = AI_SUGGEST.map(function (s) { return '<div class="s" data-q="' + s + '">' + s + '</div>'; }).join('');
   return '<div class="chat-col">'
     + '<div class="card"><div class="card__head"><h3>추천 질문</h3></div><div class="card__body"><div class="suggest">' + sug + '</div></div></div>'
@@ -522,6 +550,7 @@ function aiAsk(q) {
   setTimeout(function () { aiPush(aiAnswer(q), 'ai'); }, 350);
 }
 AFTER.ai = function () {
+  if (!DB.hasData()) return;
   var inp = $('#aiInput');
   $('#aiSend').addEventListener('click', function () { var v = inp.value.trim(); inp.value = ''; aiAsk(v); });
   inp.addEventListener('keydown', function (e) { if (e.key === 'Enter') { var v = inp.value.trim(); inp.value = ''; aiAsk(v); } });

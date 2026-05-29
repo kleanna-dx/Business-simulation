@@ -65,3 +65,30 @@
 - **플랫폼**: Cloudflare Pages (로컬 PM2 개발 서버 동작 중)
 - **상태**: ✅ 프로토타입 동작 (9개 화면 전부 렌더링·시뮬레이션 정상)
 - **최종 수정**: 2026-05-29
+
+## 데이터 모드 (DEMO_MODE) — 데모 vs 운영 분리
+
+현재 화면에 들어있는 데이터는 **모두 가상(데모) 데이터**입니다. 운영 서버 배포 시에는
+가상 데이터 없이 **빈 상태(Empty State)**로 시작하도록 `public/static/data.js`에서 분리했습니다.
+
+### 동작 방식
+- **DEMO_MODE 자동 판별** (`data.js`):
+  - `?demo=1` 쿼리 → 강제 데모(가상 데이터 표시)
+  - `?demo=0` 쿼리 → 강제 운영(빈 상태)
+  - 그 외: 호스트명이 `localhost`/`127.0.0.1`/`sandbox`/`e2b`/`novita` 면 데모, 운영 도메인이면 빈 상태
+- **데모 모드**: `DEMO_DATA`(가상 데이터)를 복사해 `DB`에 채움 → 프로토타입 시연 그대로 표시
+- **운영 모드**: `emptyDB()`(빈 배열 + `-` placeholder)로 시작 → 각 화면에 **"데이터 없음 / API 연동 대기"** Empty State 표시
+
+### API 연동 (Spring Boot)
+운영에서는 Spring Boot API 결과로 빈 `DB`를 채웁니다:
+```js
+fetch('/api/precost?plant=PM2&month=2026-05')
+  .then(r => r.json())
+  .then(payload => { DB.load(payload); route(); });
+```
+- `DB.load(payload)` : `meta/materials/movements/plans/bwRows/approvals/trend/alerts` 키를 주입하는 훅
+- `DB.hasData()` : 데이터 유무 판별 (각 PAGE 함수가 이 값으로 Empty State 분기)
+
+### 검증
+- `?demo=1` → KPI/차트/표 정상 표시 (콘솔 에러 0)
+- `?demo=0` → 전 화면 Empty State 정상 표시 (콘솔 에러 0, division-by-undefined 방지)
