@@ -14,6 +14,7 @@ var NAV = [
   { id: 'movement', icon: 'fa-truck-fast', label: '이동 계획', star: true },
   { id: 'actual', icon: 'fa-table-cells', label: '실적 입력' },
   { id: 'sim', icon: 'fa-sliders', label: '사전원가 시뮬레이션', star: true },
+  { id: 'power', icon: 'fa-bolt', label: '전력비 시뮬레이션', star: true },
   { id: 'ai', icon: 'fa-robot', label: 'AI 분석 어시스턴트', star: true },
   { g: '승인' },
   { id: 'approval', icon: 'fa-circle-check', label: '승인 워크플로', badge: 2 }
@@ -27,6 +28,7 @@ var TITLES = {
   movement:  ['이동 계획', '입고·출고·이송·조정·출하·반품 통합 관리'],
   actual:    ['실적 입력', '월 실적 원단위 입력 및 검증'],
   sim:       ['사전원가 시뮬레이션', '슬라이더로 변수 조정 → 원가·차이 실시간 계산'],
+  power:     ['전력비 시뮬레이션', '실적 기반 · 호기별 생산량/단가 조정 → 전력원단위·전력비 실시간 계산'],
   ai:        ['AI 분석 어시스턴트', '자연어로 원가 차이 원인 분석'],
   approval:  ['승인 워크플로', '사전원가 확정 결재 진행 현황']
 };
@@ -500,6 +502,171 @@ PAGES.approval = function () {
   return kpis + '<div class="tbl-wrap"><table class="tbl"><thead><tr>'
     + '<th>문서번호</th><th>제목</th><th class="num">금액</th><th>요청자</th><th>단계</th><th>일자</th><th>상태</th><th>처리</th>'
     + '</tr></thead><tbody>' + rows + '</tbody></table></div>';
+};
+
+/* ====================== 전력비 시뮬레이션 (엑셀 05.이동계획) ====================== */
+/* 데이터 소스: power-data.js의 POWER_DEMO. DEMO_MODE면 데모데이터, 운영이면 빈 상태.
+   PowerDB는 운영에서 PowerDB.load(payload)로 채움. */
+var PowerDB = (typeof DEMO_MODE !== 'undefined' && DEMO_MODE && typeof POWER_DEMO !== 'undefined')
+  ? POWER_DEMO
+  : { lines: [], months: [], lineType: {}, byMonth: {} };
+PowerDB.hasData = function () { return this.months && this.months.length > 0; };
+PowerDB.load = function (payload) {
+  if (!payload) return this;
+  var self = this;
+  ['lines', 'months', 'lineType', 'byMonth'].forEach(function (k) { if (payload[k] != null) self[k] = payload[k]; });
+  return this;
+};
+
+var PowerState = { month: null, overrides: {}, price: null };
+
+function powerCurrentMonthRec() {
+  var m = PowerState.month || (PowerDB.months[0]);
+  return { key: m, rec: (PowerDB.byMonth || {})[m] };
+}
+
+PAGES.power = function () {
+  if (!PowerDB.hasData()) return emptyState('전력비 실적 데이터가 없습니다. 운영에서는 SAP/엑셀 연동 후 호기별 전력 실적이 표시됩니다.');
+
+  var monthOpts = PowerDB.months.map(function (m) {
+    var sel = (m === (PowerState.month || PowerDB.months[0])) ? ' selected' : '';
+    var label = m.replace('-', '년 ') + '월';
+    return '<option value="' + m + '"' + sel + '>' + label + '</option>';
+  }).join('');
+
+  var cur = powerCurrentMonthRec();
+  var price = (PowerState.price != null) ? PowerState.price : (cur.rec ? cur.rec.priceAcct : 0);
+
+  var stepper = '<div class="stepper">'
+    + '<div class="step done"><div class="step__dot"><i class="fas fa-check"></i></div><div class="step__lab">실적 수신</div></div><div class="step__line"></div>'
+    + '<div class="step done"><div class="step__dot"><i class="fas fa-check"></i></div><div class="step__lab">단가 확정</div></div><div class="step__line"></div>'
+    + '<div class="step current"><div class="step__dot">3</div><div class="step__lab">생산량 시뮬레이션</div></div><div class="step__line"></div>'
+    + '<div class="step"><div class="step__dot">4</div><div class="step__lab">전력비 산출</div></div></div>';
+
+  var controls = '<div class="card"><div class="card__head"><h3><i class="fas fa-bolt" style="color:var(--blue);margin-right:7px"></i>시뮬레이션 입력</h3>'
+    + '<div class="grow"></div>' + tag('실적 기반', 'INBOUND') + '</div><div class="card__body">'
+    + '<div class="field" style="margin-bottom:14px"><label style="display:block;font-size:12px;color:var(--muted);margin-bottom:5px">대상 월</label>'
+    + '<select id="pw_month" style="width:100%;padding:9px 11px;border:1px solid var(--border-2);border-radius:8px;font-family:inherit">' + monthOpts + '</select></div>'
+    + '<div class="field" style="margin-bottom:6px"><label style="display:block;font-size:12px;color:var(--muted);margin-bottom:5px">전력단가 (회계비용 기준) [원/kWh]</label>'
+    + '<input id="pw_price" type="number" step="0.01" value="' + price.toFixed(2) + '" style="width:100%;padding:9px 11px;border:1px solid var(--border-2);border-radius:8px;font-family:inherit;text-align:right"></div>'
+    + '<div class="note" style="margin:12px 0"><i class="fas fa-circle-info"></i> 호기별 <b>생산량</b>을 수정하면 전력원단위·전력비가 실시간 재계산됩니다. (실적 사용량 kWh는 고정)</div>'
+    + '<div id="pw_inputs"></div>'
+    + '<hr class="hr">'
+    + '<button class="btn" style="width:100%" id="pw_reset"><i class="fas fa-rotate-left"></i> 실적값으로 초기화</button>'
+    + '<button class="btn btn-primary" style="width:100%;margin-top:9px" onclick="location.hash=\'approval\'"><i class="fas fa-paper-plane"></i> 전력비 결과 상신</button>'
+    + '</div></div>';
+
+  var kpis = '<div class="grid g-3" id="pwKpis"></div>';
+  var tbl = '<div class="card"><div class="card__head"><h3>호기별 전력비 상세</h3><div class="grow"></div>'
+    + '<span class="legend"><span class="l">' + tag('제지/화장지', 'TRANSFER') + 'kWh/ton</span><span class="l">' + tag('가공/생리대', 'SHIPMENT') + 'kWh/개</span></span></div>'
+    + '<div class="tbl-wrap" style="border:none;border-radius:0"><table class="tbl"><thead><tr>'
+    + '<th>호기</th><th class="num">전력사용량 [kWh]</th><th class="num">생산량</th><th class="num">전력원단위</th>'
+    + '<th class="num">전력비원단위</th><th class="num">전력비 [원]</th><th>변동</th>'
+    + '</tr></thead><tbody id="pwTbody"></tbody></table></div></div>';
+
+  return stepper
+    + '<div class="grid" style="grid-template-columns:360px 1fr;gap:16px;align-items:start">'
+    + controls
+    + '<div class="grid" style="gap:16px">' + kpis + tbl + '</div>'
+    + '</div>';
+};
+
+function powerInputsHtml() {
+  var cur = powerCurrentMonthRec();
+  if (!cur.rec) return '';
+  return PowerDB.lines.map(function (ln) {
+    var base = cur.rec.lines[ln] || { prod: 0, usage: 0 };
+    if (base.usage === 0 && base.prod === 0) return ''; // 미가동 호기는 입력 숨김
+    var ov = PowerState.overrides[ln] || {};
+    var prod = (ov.prod != null) ? ov.prod : base.prod;
+    var type = PowerDB.lineType[ln];
+    var unitTxt = (type === 'paper') ? 'kg' : 'EA';
+    return '<div class="slider-row" style="margin-bottom:10px" data-pwline="' + ln + '">'
+      + '<div class="slider-row__top" style="margin-bottom:4px"><span class="lab" style="font-size:12.5px">' + ln + '</span>'
+      + '<span class="val" style="font-size:11px;color:var(--muted-2)">실적 ' + pfmt.int(base.prod) + ' ' + unitTxt + '</span></div>'
+      + '<input type="number" class="pw_prod" data-line="' + ln + '" value="' + prod + '" '
+      + 'style="width:100%;padding:6px 9px;border:1px solid var(--border-2);border-radius:7px;font-family:inherit;text-align:right;font-size:12.5px"></div>';
+  }).join('');
+}
+
+function powerRender() {
+  var cur = powerCurrentMonthRec();
+  if (!cur.rec) return;
+  var ov = Object.assign({}, PowerState.overrides);
+  if (PowerState.price != null) ov.price = PowerState.price;
+  var res = PowerCalc.computeMonth(cur.rec, PowerDB.lines, PowerDB.lineType, ov);
+
+  // KPIs
+  var totalCost = res.totals.cost;
+  var totalUsage = res.totals.usage;
+  var perTon = res.totals.paperCostPerTon;
+  $('#pwKpis').innerHTML =
+    kpiCard('총 전력비', pfmt.baek(totalCost), '백만원', 'fa-won-sign', 'ico-blue', 'delta-flat', 'fa-bolt', cur.key.replace('-', '.') + ' 기준')
+    + kpiCard('총 전력사용량', pfmt.baek(totalUsage * 1000) , '백만kWh', 'fa-plug', 'ico-indigo', 'delta-flat', 'fa-gauge', '회계 단가 ' + res.price.toFixed(2) + '원')
+    + kpiCard('제지·화장지 톤당 전력비', pfmt.won(perTon), '원/톤', 'fa-weight-hanging', 'ico-amber', 'delta-flat', 'fa-industry', 'paper 군 가중');
+
+  // table
+  $('#pwTbody').innerHTML = res.rows.map(function (r) {
+    if (r.baseUsage === 0 && r.baseProd === 0) return '';
+    var isPaper = (r.type === 'paper');
+    var unitU = isPaper ? 'kWh/ton' : 'kWh/개';
+    var costU = isPaper ? '천원/ton' : '원/개';
+    var prodU = isPaper ? 'kg' : 'EA';
+    // 변동: 생산량이 실적과 다른지
+    var changed = Math.abs(r.prod - r.baseProd) > 0.5;
+    var deltaPct = r.baseProd > 0 ? ((r.prod - r.baseProd) / r.baseProd * 100) : 0;
+    var deltaCell = changed
+      ? '<span class="tag ' + (deltaPct >= 0 ? 'tag-up' : 'tag-down') + '">' + (deltaPct >= 0 ? '+' : '') + deltaPct.toFixed(1) + '%</span>'
+      : '<span style="color:var(--muted-2);font-size:11px">실적</span>';
+    return '<tr><td><b>' + r.line + '</b> <span class="cell-code">' + (isPaper ? 'PAPER' : 'PROC') + '</span></td>'
+      + '<td class="num">' + pfmt.int(r.usage) + '</td>'
+      + '<td class="num">' + pfmt.int(r.prod) + ' <span style="color:var(--muted-2);font-size:10px">' + prodU + '</span></td>'
+      + '<td class="num">' + pfmt.dec(r.unit, isPaper ? 2 : 4) + ' <span style="color:var(--muted-2);font-size:10px">' + unitU + '</span></td>'
+      + '<td class="num">' + pfmt.dec(r.costUnit, isPaper ? 2 : 4) + ' <span style="color:var(--muted-2);font-size:10px">' + costU + '</span></td>'
+      + '<td class="num"><b>' + pfmt.won(r.cost) + '</b></td>'
+      + '<td>' + deltaCell + '</td></tr>';
+  }).join('')
+    + '<tr class="row-total"><td>합계</td><td class="num">' + pfmt.int(res.totals.usage) + '</td>'
+    + '<td class="num">-</td><td class="num">-</td><td class="num">-</td>'
+    + '<td class="num">' + pfmt.won(res.totals.cost) + '</td><td>-</td></tr>';
+}
+
+AFTER.power = function () {
+  if (!PowerDB.hasData()) return;
+  // populate inputs
+  var box = $('#pw_inputs'); if (box) box.innerHTML = powerInputsHtml();
+
+  var ms = $('#pw_month');
+  if (ms) ms.addEventListener('change', function () {
+    PowerState.month = ms.value;
+    PowerState.overrides = {};
+    PowerState.price = null;
+    route(); // 월 변경 시 입력값/단가 리셋하므로 전체 재렌더
+  });
+
+  var ps = $('#pw_price');
+  if (ps) ps.addEventListener('input', function () {
+    PowerState.price = (ps.value === '') ? null : +ps.value;
+    powerRender();
+  });
+
+  $all('.pw_prod').forEach(function (inp) {
+    inp.addEventListener('input', function () {
+      var ln = inp.getAttribute('data-line');
+      if (!PowerState.overrides[ln]) PowerState.overrides[ln] = {};
+      PowerState.overrides[ln].prod = (inp.value === '') ? 0 : +inp.value;
+      powerRender();
+    });
+  });
+
+  var rb = $('#pw_reset');
+  if (rb) rb.addEventListener('click', function () {
+    PowerState.overrides = {};
+    PowerState.price = null;
+    route();
+  });
+
+  powerRender();
 };
 
 /* ====================== AI 분석 어시스턴트 (slide 9) ====================== */
