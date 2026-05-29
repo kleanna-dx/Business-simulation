@@ -9,6 +9,7 @@ var NAV = [
   { g: 'SAP · 기준정보' },
   { id: 'sapsync', icon: 'fa-rotate', label: 'SAP BW 수신', star: true },
   { id: 'master', icon: 'fa-layer-group', label: '자재 마스터' },
+  { id: 'prodplan', icon: 'fa-industry', label: '예상 생산량 기준정보', star: true },
   { g: '계획 · 시뮬레이션' },
   { id: 'plan', icon: 'fa-clipboard-list', label: '생산·원가 계획' },
   { id: 'movement', icon: 'fa-truck-fast', label: '이동 계획', star: true },
@@ -28,7 +29,8 @@ var TITLES = {
   movement:  ['이동 계획', '입고·출고·이송·조정·출하·반품 통합 관리'],
   actual:    ['실적 입력', '월 실적 원단위 입력 및 검증'],
   sim:       ['사전원가 시뮬레이션', '슬라이더로 변수 조정 → 원가·차이 실시간 계산'],
-  power:     ['전력비 시뮬레이션', '실적 기반 · 호기별 생산량/단가 조정 → 전력원단위·전력비 실시간 계산'],
+  prodplan:  ['예상 생산량 기준정보', '호기·월별 예상 생산량 입력(또는 엑셀 업로드) → 전 시뮬레이션 공통 기준'],
+  power:     ['전력비 시뮬레이션', '예상 생산량 기준정보 자동 반영 · 단가 조정 → 전력원단위·전력비 실시간 계산'],
   ai:        ['AI 분석 어시스턴트', '자연어로 원가 차이 원인 분석'],
   approval:  ['승인 워크플로', '사전원가 확정 결재 진행 현황']
 };
@@ -518,7 +520,67 @@ PowerDB.load = function (payload) {
   return this;
 };
 
-var PowerState = { month: null, overrides: {}, price: null };
+/* ====================== 예상 생산량 기준정보 (전역 공유) ======================
+   ProdPlan.plan[month][line] = 예상생산량 (사용자 입력/엑셀 업로드).
+   값이 없으면 PowerDB의 실적 생산량을 fallback으로 사용.
+   전력비·(추후)재료비 등 모든 시뮬레이션이 이 값을 공유한다. */
+var ProdPlan = {
+  STORAGE_KEY: 'precost_prodplan_v1',
+  plan: {},
+  loadStorage: function () {
+    try {
+      var raw = localStorage.getItem(this.STORAGE_KEY);
+      if (raw) this.plan = JSON.parse(raw) || {};
+    } catch (e) { this.plan = {}; }
+  },
+  saveStorage: function () {
+    try { localStorage.setItem(this.STORAGE_KEY, JSON.stringify(this.plan)); } catch (e) {}
+  },
+  // 실적 생산량 (PowerDB 기준)
+  actual: function (month, line) {
+    var rec = (PowerDB.byMonth || {})[month];
+    if (rec && rec.lines && rec.lines[line]) return rec.lines[line].prod || 0;
+    return 0;
+  },
+  // 예상 생산량 (입력값 있으면 그 값, 없으면 실적값)
+  get: function (month, line) {
+    if (this.plan[month] && this.plan[month][line] != null) return this.plan[month][line];
+    return this.actual(month, line);
+  },
+  // 입력값이 명시적으로 설정되었는지 (실적과 다른 계획값)
+  isSet: function (month, line) {
+    return !!(this.plan[month] && this.plan[month][line] != null);
+  },
+  set: function (month, line, val) {
+    if (!this.plan[month]) this.plan[month] = {};
+    if (val == null || val === '') { delete this.plan[month][line]; }
+    else { this.plan[month][line] = +val; }
+    this.saveStorage();
+  },
+  clearMonth: function (month) {
+    delete this.plan[month];
+    this.saveStorage();
+  },
+  // 엑셀 업로드 결과 일괄 반영: rows = [{month, line, prod}]
+  bulkSet: function (rows) {
+    var self = this, applied = 0, skipped = 0;
+    rows.forEach(function (r) {
+      if (!r.month || !r.line) { skipped++; return; }
+      if (PowerDB.lines.indexOf(r.line) < 0) { skipped++; return; }
+      if (PowerDB.months.indexOf(r.month) < 0) { skipped++; return; }
+      if (!self.plan[r.month]) self.plan[r.month] = {};
+      self.plan[r.month][r.line] = +r.prod || 0;
+      applied++;
+    });
+    this.saveStorage();
+    return { applied: applied, skipped: skipped };
+  }
+};
+ProdPlan.loadStorage();
+
+var ProdPlanState = { month: null };
+
+var PowerState = { month: null, price: null };
 
 function powerCurrentMonthRec() {
   var m = PowerState.month || (PowerDB.months[0]);
@@ -543,16 +605,18 @@ PAGES.power = function () {
     + '<div class="step current"><div class="step__dot">3</div><div class="step__lab">생산량 시뮬레이션</div></div><div class="step__line"></div>'
     + '<div class="step"><div class="step__dot">4</div><div class="step__lab">전력비 산출</div></div></div>';
 
+  var planSetCnt = PowerDB.lines.filter(function (ln) { return ProdPlan.isSet(cur.key, ln); }).length;
   var controls = '<div class="card"><div class="card__head"><h3><i class="fas fa-bolt" style="color:var(--blue);margin-right:7px"></i>시뮬레이션 입력</h3>'
     + '<div class="grow"></div>' + tag('실적 기반', 'INBOUND') + '</div><div class="card__body">'
     + '<div class="field" style="margin-bottom:14px"><label style="display:block;font-size:12px;color:var(--muted);margin-bottom:5px">대상 월</label>'
     + '<select id="pw_month" style="width:100%;padding:9px 11px;border:1px solid var(--border-2);border-radius:8px;font-family:inherit">' + monthOpts + '</select></div>'
     + '<div class="field" style="margin-bottom:6px"><label style="display:block;font-size:12px;color:var(--muted);margin-bottom:5px">전력단가 (회계비용 기준) [원/kWh]</label>'
     + '<input id="pw_price" type="number" step="0.01" value="' + price.toFixed(2) + '" style="width:100%;padding:9px 11px;border:1px solid var(--border-2);border-radius:8px;font-family:inherit;text-align:right"></div>'
-    + '<div class="note" style="margin:12px 0"><i class="fas fa-circle-info"></i> 호기별 <b>생산량</b>을 수정하면 전력원단위·전력비가 실시간 재계산됩니다. (실적 사용량 kWh는 고정)</div>'
-    + '<div id="pw_inputs"></div>'
+    + '<div class="note" style="margin:12px 0"><i class="fas fa-circle-info"></i> 생산량은 <b>예상 생산량 기준정보</b> 탭에서 입력합니다. 이 화면은 그 값을 자동 반영합니다. '
+    + (planSetCnt > 0 ? '<b style="color:var(--blue-700)">(예상값 ' + planSetCnt + '개 호기 적용 중)</b>' : '<span style="color:var(--muted-2)">(현재 실적값 사용)</span>') + '</div>'
+    + '<button class="btn" style="width:100%" onclick="location.hash=\'prodplan\'"><i class="fas fa-industry"></i> 예상 생산량 기준정보 편집</button>'
     + '<hr class="hr">'
-    + '<button class="btn" style="width:100%" id="pw_reset"><i class="fas fa-rotate-left"></i> 실적값으로 초기화</button>'
+    + '<button class="btn" style="width:100%" id="pw_resetprice"><i class="fas fa-rotate-left"></i> 단가 실적값으로 초기화</button>'
     + '<button class="btn btn-primary" style="width:100%;margin-top:9px" onclick="location.hash=\'approval\'"><i class="fas fa-paper-plane"></i> 전력비 결과 상신</button>'
     + '</div></div>';
 
@@ -571,28 +635,14 @@ PAGES.power = function () {
     + '</div>';
 };
 
-function powerInputsHtml() {
-  var cur = powerCurrentMonthRec();
-  if (!cur.rec) return '';
-  return PowerDB.lines.map(function (ln) {
-    var base = cur.rec.lines[ln] || { prod: 0, usage: 0 };
-    if (base.usage === 0 && base.prod === 0) return ''; // 미가동 호기는 입력 숨김
-    var ov = PowerState.overrides[ln] || {};
-    var prod = (ov.prod != null) ? ov.prod : base.prod;
-    var type = PowerDB.lineType[ln];
-    var unitTxt = (type === 'paper') ? 'kg' : 'EA';
-    return '<div class="slider-row" style="margin-bottom:10px" data-pwline="' + ln + '">'
-      + '<div class="slider-row__top" style="margin-bottom:4px"><span class="lab" style="font-size:12.5px">' + ln + '</span>'
-      + '<span class="val" style="font-size:11px;color:var(--muted-2)">실적 ' + pfmt.int(base.prod) + ' ' + unitTxt + '</span></div>'
-      + '<input type="number" class="pw_prod" data-line="' + ln + '" value="' + prod + '" '
-      + 'style="width:100%;padding:6px 9px;border:1px solid var(--border-2);border-radius:7px;font-family:inherit;text-align:right;font-size:12.5px"></div>';
-  }).join('');
-}
-
 function powerRender() {
   var cur = powerCurrentMonthRec();
   if (!cur.rec) return;
-  var ov = Object.assign({}, PowerState.overrides);
+  // 생산량은 ProdPlan(예상 생산량 기준정보)에서 자동 반영 — 이 화면에서는 읽기 전용
+  var ov = {};
+  PowerDB.lines.forEach(function (ln) {
+    ov[ln] = { prod: ProdPlan.get(cur.key, ln) };
+  });
   if (PowerState.price != null) ov.price = PowerState.price;
   var res = PowerCalc.computeMonth(cur.rec, PowerDB.lines, PowerDB.lineType, ov);
 
@@ -633,15 +683,12 @@ function powerRender() {
 
 AFTER.power = function () {
   if (!PowerDB.hasData()) return;
-  // populate inputs
-  var box = $('#pw_inputs'); if (box) box.innerHTML = powerInputsHtml();
 
   var ms = $('#pw_month');
   if (ms) ms.addEventListener('change', function () {
     PowerState.month = ms.value;
-    PowerState.overrides = {};
     PowerState.price = null;
-    route(); // 월 변경 시 입력값/단가 리셋하므로 전체 재렌더
+    route(); // 월 변경 시 단가 리셋 + planSetCnt 갱신 위해 전체 재렌더
   });
 
   var ps = $('#pw_price');
@@ -650,24 +697,251 @@ AFTER.power = function () {
     powerRender();
   });
 
-  $all('.pw_prod').forEach(function (inp) {
-    inp.addEventListener('input', function () {
-      var ln = inp.getAttribute('data-line');
-      if (!PowerState.overrides[ln]) PowerState.overrides[ln] = {};
-      PowerState.overrides[ln].prod = (inp.value === '') ? 0 : +inp.value;
-      powerRender();
-    });
-  });
-
-  var rb = $('#pw_reset');
+  var rb = $('#pw_resetprice');
   if (rb) rb.addEventListener('click', function () {
-    PowerState.overrides = {};
     PowerState.price = null;
     route();
   });
 
   powerRender();
 };
+
+/* ====================== 예상 생산량 기준정보 화면 (#prodplan) ====================== */
+function prodplanCurrentMonth() {
+  return ProdPlanState.month || (PowerDB.months[0]);
+}
+
+PAGES.prodplan = function () {
+  if (!PowerDB.hasData()) return emptyState('생산량 기준이 되는 실적 데이터가 없습니다. 운영에서는 SAP/엑셀 연동 후 호기별 실적 생산량이 표시됩니다.');
+
+  var monthOpts = PowerDB.months.map(function (m) {
+    var sel = (m === prodplanCurrentMonth()) ? ' selected' : '';
+    return '<option value="' + m + '"' + sel + '>' + m.replace('-', '년 ') + '월</option>';
+  }).join('');
+
+  var cur = prodplanCurrentMonth();
+  var setCnt = PowerDB.lines.filter(function (ln) { return ProdPlan.isSet(cur, ln); }).length;
+
+  // 상단 안내 + 업로드 카드
+  var head = '<div class="card"><div class="card__head"><h3><i class="fas fa-industry" style="color:var(--blue);margin-right:7px"></i>예상 생산량 기준정보</h3>'
+    + '<div class="grow"></div>' + tag('전 시뮬레이션 공통', 'INBOUND') + '</div><div class="card__body">'
+    + '<div class="note" style="margin-bottom:14px"><i class="fas fa-circle-info"></i> 여기서 입력한 <b>예상 생산량</b>이 전력비 등 모든 원가 시뮬레이션의 공통 기준이 됩니다. '
+    + '값을 비워두면 해당 호기는 <b>실적 생산량</b>을 그대로 사용합니다.</div>'
+    + '<div class="grid" style="grid-template-columns:1fr 1fr;gap:12px">'
+    + '<div class="field"><label style="display:block;font-size:12px;color:var(--muted);margin-bottom:5px">대상 월</label>'
+    + '<select id="pp_month" style="width:100%;padding:9px 11px;border:1px solid var(--border-2);border-radius:8px;font-family:inherit">' + monthOpts + '</select></div>'
+    + '<div class="field" style="display:flex;align-items:flex-end;gap:8px">'
+    + '<button class="btn" style="flex:1" id="pp_template"><i class="fas fa-download"></i> 엑셀 양식 받기</button>'
+    + '<label class="btn btn-primary" style="flex:1;text-align:center;cursor:pointer;margin:0"><i class="fas fa-file-import"></i> 엑셀 업로드'
+    + '<input type="file" id="pp_file" accept=".xlsx,.xls,.csv" style="display:none"></label></div>'
+    + '</div>'
+    + '<div id="pp_uploadmsg" style="margin-top:10px"></div>'
+    + '</div></div>';
+
+  var summary = '<div class="grid g-3" id="ppKpis" style="margin-top:16px"></div>';
+
+  var tbl = '<div class="card" style="margin-top:16px"><div class="card__head"><h3>호기별 예상 생산량 입력 <span style="font-size:12px;color:var(--muted)">(' + cur.replace('-', '.') + ')</span></h3>'
+    + '<div class="grow"></div>'
+    + '<span id="pp_setbadge">' + (setCnt > 0 ? tag('예상값 ' + setCnt + '개 적용', 'TRANSFER') : tag('전부 실적값', 'SHIPMENT')) + '</span>'
+    + '<button class="btn" id="pp_resetmonth" style="margin-left:9px"><i class="fas fa-rotate-left"></i> 이 달 전체 실적값으로</button>'
+    + '</div>'
+    + '<div class="tbl-wrap" style="border:none;border-radius:0"><table class="tbl"><thead><tr>'
+    + '<th>호기</th><th>구분</th><th class="num">실적 생산량</th><th class="num">예상 생산량 (입력)</th><th class="num">증감</th>'
+    + '</tr></thead><tbody id="ppTbody"></tbody></table></div></div>';
+
+  return head + summary + tbl;
+};
+
+function prodplanRenderTable() {
+  var cur = prodplanCurrentMonth();
+  $('#ppTbody').innerHTML = PowerDB.lines.map(function (ln) {
+    var actual = ProdPlan.actual(cur, ln);
+    var rec = (PowerDB.byMonth || {})[cur];
+    var baseUsage = (rec && rec.lines && rec.lines[ln]) ? rec.lines[ln].usage : 0;
+    if (actual === 0 && baseUsage === 0) return ''; // 미가동 호기 숨김
+    var type = PowerDB.lineType[ln];
+    var unitTxt = (type === 'paper') ? 'kg' : 'EA';
+    var isSet = ProdPlan.isSet(cur, ln);
+    var planVal = isSet ? ProdPlan.plan[cur][ln] : '';
+    var deltaPct = (isSet && actual > 0) ? ((planVal - actual) / actual * 100) : 0;
+    var deltaCell = isSet
+      ? '<span class="tag ' + (deltaPct >= 0 ? 'tag-up' : 'tag-down') + '">' + (deltaPct >= 0 ? '+' : '') + deltaPct.toFixed(1) + '%</span>'
+      : '<span style="color:var(--muted-2);font-size:11px">실적 사용</span>';
+    return '<tr><td><b>' + ln + '</b></td>'
+      + '<td><span class="cell-code">' + (type === 'paper' ? 'PAPER' : 'PROC') + '</span></td>'
+      + '<td class="num">' + pfmt.int(actual) + ' <span style="color:var(--muted-2);font-size:10px">' + unitTxt + '</span></td>'
+      + '<td class="num"><input type="number" class="pp_prod" data-line="' + ln + '" value="' + planVal + '" placeholder="' + pfmt.int(actual) + '" '
+      + 'style="width:130px;padding:6px 9px;border:1px solid var(--border-2);border-radius:7px;font-family:inherit;text-align:right;font-size:12.5px"></td>'
+      + '<td>' + deltaCell + '</td></tr>';
+  }).join('');
+
+  // KPI 요약
+  var setCnt = PowerDB.lines.filter(function (ln) { return ProdPlan.isSet(cur, ln); }).length;
+  var paperActual = 0, paperPlan = 0;
+  PowerDB.lines.forEach(function (ln) {
+    if (PowerDB.lineType[ln] === 'paper') { paperActual += ProdPlan.actual(cur, ln); paperPlan += ProdPlan.get(cur, ln); }
+  });
+  var paperDelta = paperActual > 0 ? ((paperPlan - paperActual) / paperActual * 100) : 0;
+  $('#ppKpis').innerHTML =
+    kpiCard('예상값 입력 호기', setCnt + ' / ' + PowerDB.lines.length, '개', 'fa-pen', 'ico-blue', 'delta-flat', 'fa-industry', cur.replace('-', '.') + ' 기준')
+    + kpiCard('제지·화장지 예상 생산량', pfmt.int(paperPlan / 1000), '톤', 'fa-weight-hanging', 'ico-indigo', (paperDelta >= 0 ? 'delta-up' : 'delta-down'), (paperDelta >= 0 ? 'fa-arrow-up' : 'fa-arrow-down'), (paperDelta >= 0 ? '+' : '') + paperDelta.toFixed(1) + '% vs 실적')
+    + kpiCard('실적 대비 변동', (paperDelta >= 0 ? '+' : '') + paperDelta.toFixed(1), '%', 'fa-chart-line', 'ico-amber', 'delta-flat', 'fa-bolt', 'paper 군 가중');
+
+  // 배지 갱신
+  var badge = $('#pp_setbadge');
+  if (badge) badge.innerHTML = (setCnt > 0 ? tag('예상값 ' + setCnt + '개 적용', 'TRANSFER') : tag('전부 실적값', 'SHIPMENT'));
+}
+
+function prodplanDownloadTemplate() {
+  // 호기 x 월 행렬 양식 (열: 호기, 2026-01 ... 2026-12) — 실적값을 채워서 제공
+  var header = ['호기'].concat(PowerDB.months);
+  var aoa = [header];
+  PowerDB.lines.forEach(function (ln) {
+    var row = [ln];
+    PowerDB.months.forEach(function (m) { row.push(ProdPlan.actual(m, ln)); });
+    aoa.push(row);
+  });
+  if (typeof XLSX === 'undefined') {
+    // CSV fallback
+    var csv = aoa.map(function (r) { return r.join(','); }).join('\n');
+    var blob = new Blob(['\uFEFF' + csv], { type: 'text/csv;charset=utf-8;' });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a'); a.href = url; a.download = '예상생산량_양식.csv'; a.click();
+    URL.revokeObjectURL(url);
+    return;
+  }
+  var ws = XLSX.utils.aoa_to_sheet(aoa);
+  var wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, '예상생산량');
+  XLSX.writeFile(wb, '예상생산량_양식.xlsx');
+}
+
+function prodplanHandleFile(file) {
+  var msg = $('#pp_uploadmsg');
+  if (typeof XLSX === 'undefined') {
+    if (msg) msg.innerHTML = '<div class="note" style="border-color:var(--red,#dc2626);color:var(--red,#dc2626)"><i class="fas fa-triangle-exclamation"></i> 엑셀 파서를 불러오지 못했습니다. 네트워크 확인 후 다시 시도하세요.</div>';
+    return;
+  }
+  var reader = new FileReader();
+  reader.onload = function (e) {
+    try {
+      var data = new Uint8Array(e.target.result);
+      var wb = XLSX.read(data, { type: 'array' });
+      var ws = wb.Sheets[wb.SheetNames[0]];
+      var aoa = XLSX.utils.sheet_to_json(ws, { header: 1, blankrows: false });
+      if (!aoa.length) throw new Error('빈 시트');
+      // 헤더 행: 첫 셀이 '호기'(또는 line), 이후 셀이 월(YYYY-MM)
+      var header = aoa[0].map(function (c) { return ('' + c).trim(); });
+      // 월 컬럼 인덱스 매핑
+      var monthCols = {}; // colIndex -> 'YYYY-MM'
+      header.forEach(function (h, i) {
+        if (i === 0) return;
+        var norm = normMonth(h);
+        if (norm) monthCols[i] = norm;
+      });
+      var rows = [];
+      for (var r = 1; r < aoa.length; r++) {
+        var line = ('' + (aoa[r][0] || '')).trim();
+        if (!line) continue;
+        Object.keys(monthCols).forEach(function (ci) {
+          var v = aoa[r][ci];
+          if (v === '' || v == null) return;
+          var num = +('' + v).replace(/,/g, '');
+          if (isNaN(num)) return;
+          rows.push({ month: monthCols[ci], line: line, prod: num });
+        });
+      }
+      var res = ProdPlan.bulkSet(rows);
+      if (msg) {
+        var cls = res.applied > 0 ? 'tag-up' : 'tag-gray';
+        msg.innerHTML = '<div class="note" style="border-color:var(--blue);color:var(--blue-700)"><i class="fas fa-circle-check"></i> 업로드 완료 — '
+          + '<b>' + res.applied + '건 반영</b>' + (res.skipped > 0 ? ', ' + res.skipped + '건 건너뜀(호기/월 불일치)' : '') + '. 전력비 시뮬레이션에 자동 적용됩니다.</div>';
+      }
+      prodplanRenderTable();
+    } catch (err) {
+      if (msg) msg.innerHTML = '<div class="note" style="border-color:#dc2626;color:#dc2626"><i class="fas fa-triangle-exclamation"></i> 엑셀을 읽지 못했습니다: ' + (err.message || err) + '</div>';
+    }
+  };
+  reader.readAsArrayBuffer(file);
+}
+
+// 다양한 월 표기를 'YYYY-MM'으로 정규화 ('2026-01', '2026년 1월', '2026.1', '2026/01' 등)
+function normMonth(s) {
+  s = ('' + s).trim();
+  var m = s.match(/(\d{4})\D+(\d{1,2})/);
+  if (!m) return null;
+  var y = m[1], mo = ('0' + m[2]).slice(-2);
+  var key = y + '-' + mo;
+  return (PowerDB.months.indexOf(key) >= 0) ? key : key; // 검증은 bulkSet에서
+}
+
+AFTER.prodplan = function () {
+  if (!PowerDB.hasData()) return;
+
+  var ms = $('#pp_month');
+  if (ms) ms.addEventListener('change', function () {
+    ProdPlanState.month = ms.value;
+    route();
+  });
+
+  $('#pp_template') && $('#pp_template').addEventListener('click', prodplanDownloadTemplate);
+
+  var file = $('#pp_file');
+  if (file) file.addEventListener('change', function () {
+    if (file.files && file.files[0]) prodplanHandleFile(file.files[0]);
+    file.value = ''; // 같은 파일 재업로드 허용
+  });
+
+  var rm = $('#pp_resetmonth');
+  if (rm) rm.addEventListener('click', function () {
+    ProdPlan.clearMonth(prodplanCurrentMonth());
+    route();
+  });
+
+  // 입력 이벤트 (위임)
+  var tbody = $('#ppTbody');
+  if (tbody) tbody.addEventListener('input', function (e) {
+    var inp = e.target;
+    if (!inp.classList || !inp.classList.contains('pp_prod')) return;
+    var ln = inp.getAttribute('data-line');
+    ProdPlan.set(prodplanCurrentMonth(), ln, inp.value);
+    // 표 전체 재렌더 대신 KPI/증감만 갱신하면 입력 포커스 유지가 어려움 → 디바운스 없이 KPI만 갱신
+    prodplanUpdateRowDelta(inp, ln);
+  });
+
+  prodplanRenderTable();
+};
+
+// 입력 중 포커스 유지를 위해 해당 행의 증감/KPI만 갱신
+function prodplanUpdateRowDelta(inp, ln) {
+  var cur = prodplanCurrentMonth();
+  var actual = ProdPlan.actual(cur, ln);
+  var isSet = ProdPlan.isSet(cur, ln);
+  var tr = inp.closest('tr');
+  if (tr) {
+    var cell = tr.children[4];
+    if (isSet && actual > 0) {
+      var d = (ProdPlan.plan[cur][ln] - actual) / actual * 100;
+      cell.innerHTML = '<span class="tag ' + (d >= 0 ? 'tag-up' : 'tag-down') + '">' + (d >= 0 ? '+' : '') + d.toFixed(1) + '%</span>';
+    } else {
+      cell.innerHTML = '<span style="color:var(--muted-2);font-size:11px">실적 사용</span>';
+    }
+  }
+  // KPI/배지 갱신
+  var setCnt = PowerDB.lines.filter(function (l) { return ProdPlan.isSet(cur, l); }).length;
+  var paperActual = 0, paperPlan = 0;
+  PowerDB.lines.forEach(function (l) {
+    if (PowerDB.lineType[l] === 'paper') { paperActual += ProdPlan.actual(cur, l); paperPlan += ProdPlan.get(cur, l); }
+  });
+  var paperDelta = paperActual > 0 ? ((paperPlan - paperActual) / paperActual * 100) : 0;
+  var kp = $('#ppKpis');
+  if (kp) kp.innerHTML =
+    kpiCard('예상값 입력 호기', setCnt + ' / ' + PowerDB.lines.length, '개', 'fa-pen', 'ico-blue', 'delta-flat', 'fa-industry', cur.replace('-', '.') + ' 기준')
+    + kpiCard('제지·화장지 예상 생산량', pfmt.int(paperPlan / 1000), '톤', 'fa-weight-hanging', 'ico-indigo', (paperDelta >= 0 ? 'delta-up' : 'delta-down'), (paperDelta >= 0 ? 'fa-arrow-up' : 'fa-arrow-down'), (paperDelta >= 0 ? '+' : '') + paperDelta.toFixed(1) + '% vs 실적')
+    + kpiCard('실적 대비 변동', (paperDelta >= 0 ? '+' : '') + paperDelta.toFixed(1), '%', 'fa-chart-line', 'ico-amber', 'delta-flat', 'fa-bolt', 'paper 군 가중');
+  var badge = $('#pp_setbadge');
+  if (badge) badge.innerHTML = (setCnt > 0 ? tag('예상값 ' + setCnt + '개 적용', 'TRANSFER') : tag('전부 실적값', 'SHIPMENT'));
+}
 
 /* ====================== AI 분석 어시스턴트 (slide 9) ====================== */
 var AI_SUGGEST = [

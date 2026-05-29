@@ -31,6 +31,7 @@ app.get('/', (c) => {
   <script src="/static/data.js"></script>
   <script src="/static/power-data.js"></script>
   <script src="/static/power-calc.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>`)
