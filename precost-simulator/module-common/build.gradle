@@ -1,0 +1,19 @@
+// module-common: 모든 모듈이 의존하는 공통 클래스 모음
+// (BaseEntity, ApiResponse, ErrorCode, Exception, GlobalExceptionHandler 등)
+dependencies {
+    // Spring Web (ResponseEntity, @ControllerAdvice 등)
+    implementation 'org.springframework.boot:spring-boot-starter-web'
+    // JPA Auditing (BaseEntity @CreatedDate 등)
+    implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
+    implementation 'org.springframework.boot:spring-boot-starter-validation'
+    // Security (GlobalExceptionHandler 의 AccessDeniedException, AuditorAware 사용)
+    implementation 'org.springframework.boot:spring-boot-starter-security'
+
+    // Jackson (JSON 직렬화)
+    implementation 'com.fasterxml.jackson.core:jackson-databind'
+}
+
+// spring-boot 플러그인 미적용 라이브러리 모듈: plain jar 생성
+jar {
+    enabled = true
+}

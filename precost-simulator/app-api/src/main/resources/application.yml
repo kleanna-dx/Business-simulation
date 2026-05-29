@@ -1,0 +1,82 @@
+# =====================================================================
+# application.yml - 공통 기본 설정
+# 프로파일별 오버라이드: application-local.yml, application-prod.yml
+# =====================================================================
+spring:
+  application:
+    name: precost-simulator
+  profiles:
+    active: local
+
+  datasource:
+    driver-class-name: org.mariadb.jdbc.Driver
+    # 실제 접속정보는 프로파일별 yml / 환경변수로 주입
+    url: ${DB_URL:jdbc:mariadb://localhost:3306/precost?characterEncoding=utf8mb4&serverTimezone=Asia/Seoul}
+    username: ${DB_USERNAME:precost}
+    password: ${DB_PASSWORD:precost}
+    hikari:
+      maximum-pool-size: 10
+      minimum-idle: 2
+      connection-timeout: 30000
+
+  jpa:
+    open-in-view: false
+    hibernate:
+      # 사내 표준: 스키마는 Flyway가 관리, JPA는 절대 DDL을 생성하지 않는다.
+      ddl-auto: none
+    properties:
+      hibernate:
+        # @Table/@Column 명을 DB에 그대로 반영 (변환 없음)
+        physical_naming_strategy: org.hibernate.boot.model.naming.PhysicalNamingStrategyStandardImpl
+        format_sql: true
+        jdbc:
+          time_zone: Asia/Seoul
+    show-sql: false
+
+  flyway:
+    enabled: true
+    baseline-on-migrate: true
+    # module-auth(V0*) + module-domain(V1,V2) 의 마이그레이션을 모두 클래스패스에서 로드
+    locations: classpath:db/migration
+    encoding: UTF-8
+
+# ----------------------- 보안/JWT -----------------------
+security:
+  jwt:
+    # 운영에서는 반드시 환경변수(JWT_SECRET)로 32바이트 이상 비밀키 주입
+    secret: ${JWT_SECRET:local-dev-secret-key-please-change-in-production-1234567890}
+    access-token-validity-ms: 1800000      # 30분
+    refresh-token-validity-ms: 604800000   # 7일
+    issuer: precost-simulator
+  login:
+    max-attempts: 5
+
+# ----------------------- OpenAPI -----------------------
+springdoc:
+  swagger-ui:
+    path: /swagger-ui.html
+    operations-sorter: method
+  api-docs:
+    path: /v3/api-docs
+
+# ----------------------- Actuator ----------------------
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      show-details: when_authorized
+
+server:
+  port: ${SERVER_PORT:8080}
+  servlet:
+    encoding:
+      charset: UTF-8
+      force: true
+
+logging:
+  level:
+    com.company.precost: INFO
+    org.hibernate.SQL: WARN

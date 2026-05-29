@@ -1,0 +1,24 @@
+dependencies {
+    api project(':module-common')
+    api project(':module-domain')
+
+    implementation 'org.springframework.boot:spring-boot-starter-web'
+    implementation 'org.springframework.boot:spring-boot-starter-security'
+    implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
+    implementation 'org.springframework.boot:spring-boot-starter-validation'
+
+    // JWT (jjwt 0.12.x)
+    implementation "io.jsonwebtoken:jjwt-api:${jjwtVersion}"
+    runtimeOnly    "io.jsonwebtoken:jjwt-impl:${jjwtVersion}"
+    runtimeOnly    "io.jsonwebtoken:jjwt-jackson:${jjwtVersion}"
+
+    // OpenAPI 문서화
+    implementation "org.springdoc:springdoc-openapi-starter-webmvc-ui:${springdocVersion}"
+
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
+    testImplementation 'org.springframework.security:spring-security-test'
+    testRuntimeOnly 'com.h2database:h2'
+}
+
+jar { enabled = true }
+bootJar { enabled = false }

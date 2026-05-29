@@ -1,0 +1,12 @@
+// module-calc: 사전원가 계산 엔진 (순수 Java, DB·Spring 의존성 없음)
+// 영역 A~D 산식을 BigDecimal 로 구현하고 단위 테스트로 검증한다.
+dependencies {
+    // 의존성 최소 원칙: Lombok 과 테스트(JUnit/AssertJ)만
+    // (Spring, JPA 의존 금지 → 순수 단위 테스트 가능)
+    compileOnly "org.projectlombok:lombok:${lombokVersion}"
+    annotationProcessor "org.projectlombok:lombok:${lombokVersion}"
+}
+
+jar {
+    enabled = true
+}

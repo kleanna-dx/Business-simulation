@@ -1,0 +1,25 @@
+// ===========================================================================
+// 사전원가 시뮬레이션 웹 시스템 - Gradle 멀티모듈 설정
+// 기술 기반: Java 17 + Spring Boot 3.2.5 + Gradle 멀티모듈 + MariaDB 10.11
+// ===========================================================================
+rootProject.name = 'precost-simulator'
+
+// --- 공통 인프라 모듈 (Phase 1) ---
+include 'module-common'   // 공통 유틸 (BaseEntity, ApiResponse, ErrorCode 등)
+include 'module-calc'     // 사전원가 계산 엔진 (순수 Java)
+include 'module-domain'   // JPA 엔티티 + Repository 통합
+
+// --- 애플리케이션 모듈 ---
+include 'app-api'         // 메인 웹 애플리케이션 (REST API)
+include 'app-batch'       // SAP 월배치 (Spring Batch)
+
+// --- 도메인 모듈 (Phase 1~2) ---
+include 'module-auth'             // 모듈 9: 인증/인가 (가장 먼저)
+include 'module-sap-sync'         // 모듈 1: SAP 연동 / 전월 사용현황
+include 'module-master-data'      // 모듈 2: 마스터 관리
+include 'module-production-plan'  // 모듈 3: 월간 생산계획
+include 'module-movement'         // 모듈 4: 이동계획 통합 ⭐
+include 'module-cost-simulation'  // 모듈 5: 사전원가 시뮬레이션 ⭐
+include 'module-price-change'     // 모듈 6: 단가 관리
+include 'module-approval'         // 모듈 7: 결재 워크플로
+include 'module-dashboard'        // 모듈 8: 대시보드

@@ -1,21 +1,67 @@
-```txt
-npm install
-npm run dev
-```
+# 사전원가 시뮬레이션 웹 시스템 (Pre-Cost Simulation)
 
-```txt
-npm run deploy
-```
+제지/위생용지 공장의 월 사전원가를 산출·시뮬레이션하는 웹 시스템입니다.
+**Wireframe v2.0** 기반의 클릭 가능한 프론트엔드 프로토타입(SPA)입니다.
 
-[For generating/synchronizing types based on your Worker configuration run](https://developers.cloudflare.com/workers/wrangler/commands/#types):
+## 프로젝트 개요
+- **목표**: SAP BW로 수신한 기준정보 + 사용자 실적입력으로 사전원가를 계산하고, 변수 슬라이더로 실시간 시뮬레이션
+- **디자인**: PPTX에서 추출한 Slate + Blue 엔터프라이즈 대시보드 디자인 시스템
+- **산식**: module-calc(Java)를 JS로 포팅 — V·P·W·X·Y·Z·AA
 
-```txt
-npm run cf-typegen
-```
+## 구현 완료 기능 (9개 화면)
+| # | 화면 | 경로 | 설명 |
+|---|------|------|------|
+| 11 | 대시보드 | `#dashboard` | KPI 4종 + 월별 추이 막대 + 자재별 차이 TOP + 알림 |
+| 3 | SAP BW 수신 | `#sapsync` | SAP 자동 수신 기준정보(L·M·생산계획) 테이블 |
+| - | 자재 마스터 | `#master` | 자재 기준정보 + 가중평균단가 V 구성(R·S·T·U) |
+| 5 | 생산·원가 계획 | `#plan` | 호기별 월 생산계획 그리드 |
+| 6 | 이동 계획 | `#movement` | 입고·출고·이송·조정·출하·반품 통합 그리드 + 다단 필터 |
+| 7 | 실적 입력 | `#actual` | 실적원단위(Q) 입력 + ±2% 초과 경고 판정 |
+| 8 | 사전원가 시뮬레이션 | `#sim` | 슬라이더(생산량/폐품율/원단위/단가) → KPI 3종 + 폭포차트 + 자재표 **실시간 재계산** |
+| 9 | AI 분석 어시스턴트 | `#ai` | 자연어 질의 → 원가차이 원인 분석 챗봇 |
+| 10 | 승인 워크플로 | `#approval` | 사전원가 확정 결재 진행 현황 |
 
-Pass the `CloudflareBindings` as generics when instantiation `Hono`:
+## 산식 엔진 (calc.js)
+- **V** 가중평균단가 = (R·S + T·U) / (R + T)
+- **P** 사용량 = Q × 생산톤
+- **W** 재료비(백만원) = P × V / 1,000,000
+- **X** 톤당원가 = W / 생산톤 × 1,000,000
+- **Y** 물량차이 = (L − Q) × M × 생산톤
+- **Z** 가격차이 = Q × (M − V) × 생산톤
+- **AA** 총차이 = Y + Z
 
-```ts
-// src/index.ts
-const app = new Hono<{ Bindings: CloudflareBindings }>()
-```
+### 검증 케이스 (LATEX 2000041, 4월 BW → 5월 사전원가)
+입력: L=5.3643, M=1512.90, Q=5.20, V=1550, 생산톤=16,000
+- Y = (5.3643 − 5.20) × 1512.90 × 16000 = **3,977,112** ✓
+- Z = 5.20 × (1512.90 − 1550) × 16000 = **−3,086,720** ✓
+- AA = Y + Z = **890,392** ✓
+
+## 데이터 모델 (data.js — Mock DB)
+- `DB.meta` 플랜트/월/지종/평량/생산톤/폐품율
+- `DB.materials` 자재(LATEX·BOOSTER·CLAY) L·M·Q·R·S·T·U
+- `DB.movements` 이동 7건, `DB.plans` 3건, `DB.bwRows` 5건, `DB.approvals` 4건
+- `DB.trend` 월별 추이, `DB.alerts` 알림, `TAGCLS` 상태→태그 매핑
+- 색상 의미: SAP(blue)=자동수신 · USR(indigo)=사용자입력 · SYS(cyan)=시스템계산 · VAR(amber)=차이분석
+
+## 사용 가이드
+1. 좌측 사이드바에서 화면 이동 (해시 라우팅 `#route`)
+2. **사전원가 시뮬레이션(#sim)**: 슬라이더를 움직이면 KPI/폭포차트/자재표가 즉시 재계산
+3. **이동 계획(#movement)**: 유형/자재/상태/검색 필터로 그리드 실시간 필터링
+4. **AI 어시스턴트(#ai)**: 추천 질문 클릭 또는 직접 입력
+
+## 기술 스택
+- **백엔드**: Hono (TypeScript) on Cloudflare Pages/Workers
+- **프론트엔드**: Vanilla JS SPA (해시 라우팅), Pretendard + FontAwesome CDN
+- **빌드**: Vite, **서빙**: wrangler pages dev + PM2 (port 3000)
+- 정적 자산: `public/static/{app.css, calc.js, data.js, app.js}`
+
+## 향후 작업 (미구현)
+- 실제 Spring Boot API(`/api/...`) 연동 — 현재 Mock DB 사용
+- 실적 입력값 저장/검증 백엔드 연동
+- AI 어시스턴트 LLM 실연동(현재 규칙기반 응답)
+- 다국어/권한별 화면 분기
+
+## 배포 상태
+- **플랫폼**: Cloudflare Pages (로컬 PM2 개발 서버 동작 중)
+- **상태**: ✅ 프로토타입 동작 (9개 화면 전부 렌더링·시뮬레이션 정상)
+- **최종 수정**: 2026-05-29
