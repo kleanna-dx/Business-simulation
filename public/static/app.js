@@ -537,16 +537,16 @@ PAGES.approval = function () {
    PowerDB는 운영에서 PowerDB.load(payload)로 채움. */
 var PowerDB = (typeof DEMO_MODE !== 'undefined' && DEMO_MODE && typeof POWER_DEMO !== 'undefined')
   ? POWER_DEMO
-  : { lines: [], months: [], lineType: {}, byMonth: {}, unit: {}, group: {}, essGuarantee: {}, essEff: 0.9 };
+  : { lines: [], months: [], lineType: {}, byMonth: {}, unit: {}, group: {}, essGuarantee: {}, essEff: 0.9, lami: null };
 PowerDB.hasData = function () { return this.months && this.months.length > 0; };
 PowerDB.load = function (payload) {
   if (!payload) return this;
   var self = this;
-  ['lines', 'months', 'lineType', 'byMonth', 'unit', 'group', 'essGuarantee', 'essEff'].forEach(function (k) { if (payload[k] != null) self[k] = payload[k]; });
+  ['lines', 'months', 'lineType', 'byMonth', 'unit', 'group', 'essGuarantee', 'essEff', 'lami'].forEach(function (k) { if (payload[k] != null) self[k] = payload[k]; });
   return this;
 };
-// computeMonth에 전달할 ESS 옵션
-PowerDB.essOpt = function () { return { essGuarantee: this.essGuarantee || {}, essEff: (this.essEff != null) ? this.essEff : 0.9 }; };
+// computeMonth에 전달할 옵션 (ESS 충전식 + 라미네이팅 고정값 규칙)
+PowerDB.essOpt = function () { return { essGuarantee: this.essGuarantee || {}, essEff: (this.essEff != null) ? this.essEff : 0.9, lami: this.lami || null }; };
 
 /* ====================== 예상 생산량 기준정보 (전역 공유) ======================
    ProdPlan.plan[month][line] = { prod?, hours? }  (예상 생산량 / 예상 가동시간)
@@ -729,7 +729,8 @@ PAGES.power = function () {
   var kpis = '<div class="grid g-3" id="pwKpis"></div>';
   var tbl = '<div class="card"><div class="card__head"><h3>호기별 전력비 상세</h3><div class="grow"></div>'
     + '<span class="legend"><span class="l">' + tag('제지/화장지', 'TRANSFER') + 'kWh/ton</span><span class="l">' + tag('가공/생리대', 'SHIPMENT') + 'kWh/개</span></span></div>'
-    + '<div class="note" style="margin:0 0 6px"><i class="fas fa-circle-info"></i> 전력사용량 = <b>모고객</b>(가동시간 비례 A방식) + <b>ESS</b>(충전식: ESS충전보증량 × (평일+토요일) × 효율 0.9)</div>'
+    + '<div class="note" style="margin:0 0 6px"><i class="fas fa-circle-info"></i> 전력사용량 = <b>모고객</b> + <b>ESS</b>(충전식: 보증량×(평일+토)×0.9)<br>'
+    + '<span style="color:var(--muted)">└ 모고객 = 호기 A방식(시간당전력×예상가동시간) + 공통설비배분(TOC·EDI·복합보일러NOX·에너지재활용 × 생산량비율) + 라미네이팅 고정값(제지2·3 동시 23,000 / 한 호기 15,000) <i class="fas fa-circle-question" title="모고객 셀에 마우스를 올리면 호기별 구성(A방식/공통배분/라미고정)이 표시됩니다"></i></span></div>'
     + '<div class="tbl-wrap" style="border:none;border-radius:0"><table class="tbl"><thead><tr>'
     + '<th>호기</th><th class="num">가동시간 [Hr]</th><th class="num">모고객 [kWh]</th><th class="num">ESS [kWh]</th><th class="num">사용량 합계 [kWh]</th><th class="num">생산량</th><th class="num">전력원단위</th>'
     + '<th class="num">전력비원단위</th><th class="num">전력비 [원]</th><th>변동</th>'
@@ -810,11 +811,17 @@ function powerRender() {
     var hoursCell = (r.planHours != null)
       ? pfmt.dec(r.planHours, 0)
       : '<span style="color:var(--muted-2);font-size:11px" title="실적 가동시간 없음 → 생산량 기준(B방식)">N/A</span>';
-    var modeBadge = (r.usageMode === 'B') ? ' <span class="cell-code" title="가동시간 실적 없음: 실적 모고객 사용량 그대로 사용">B</span>' : '';
+    var modeBadge = (r.usageMode === 'B') ? ' <span class="cell-code" title="가동시간 실적 없음: 실적 모고객 사용량 그대로 사용">B</span>'
+      : (r.usageMode === 'lami') ? ' <span class="cell-code" title="라미네이팅 고정값: 제지2·제지3 모두 가동=23,000 / 하나만=15,000 / 미가동=0">고정</span>'
+      : '';
+    // 모고객 구성 tooltip: A방식 + 공통설비배분 + 라미고정
+    var moTip = '모고객 구성  ·  A방식(호기) ' + pfmt.int(r.moBase)
+      + ' + 공통설비배분 ' + pfmt.int(r.moCommon)
+      + (r.moLami ? ' + 라미고정 ' + pfmt.int(r.moLami) : '') + ' kWh';
     var essBadge = (r.essMode === 'charge') ? ' <span class="cell-code" title="ESS 충전식: 보증량 ' + pfmt.dec(r.essGuarantee, 1) + ' × (평일+토) × 0.9">충전</span>' : '';
     return '<tr><td><b>' + r.line + '</b> <span class="cell-code">' + (isPaper ? 'PAPER' : 'PROC') + '</span></td>'
       + '<td class="num">' + hoursCell + '</td>'
-      + '<td class="num">' + pfmt.int(r.usageMo) + modeBadge + '</td>'
+      + '<td class="num" title="' + moTip + '">' + pfmt.int(r.usageMo) + modeBadge + '</td>'
       + '<td class="num">' + pfmt.int(r.usageEss) + essBadge + '</td>'
       + '<td class="num"><b>' + pfmt.int(r.usage) + '</b></td>'
       + '<td class="num">' + pfmt.int(r.prod) + ' <span style="color:var(--muted-2);font-size:10px">' + prodU + '</span></td>'
@@ -824,7 +831,7 @@ function powerRender() {
       + '<td>' + deltaCell + '</td></tr>';
   }).join('')
     + '<tr class="row-total"><td>합계</td><td class="num">-</td>'
-    + '<td class="num">' + pfmt.int(res.totals.usageMo) + '</td>'
+    + '<td class="num" title="A방식 ' + pfmt.int(res.totals.moBase) + ' + 공통설비배분 ' + pfmt.int(res.totals.moCommon) + ' + 라미고정 ' + pfmt.int(res.totals.moLami) + '">' + pfmt.int(res.totals.usageMo) + '</td>'
     + '<td class="num">' + pfmt.int(res.totals.usageEss) + '</td>'
     + '<td class="num"><b>' + pfmt.int(res.totals.usage) + '</b></td>'
     + '<td class="num">-</td><td class="num">-</td><td class="num">-</td>'

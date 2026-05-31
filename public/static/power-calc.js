@@ -53,8 +53,33 @@ var PowerCalc = (function () {
     opt = opt || {};
     var essGuarantee = opt.essGuarantee || {};   // { 호기: kWh }
     var essEff = (opt.essEff != null) ? +opt.essEff : 0.9;
+    var lami = opt.lami || null;                 // { lines:[], paperRefs:[], both, one }
 
     var price = (overrides.price != null) ? +overrides.price : monthRec.priceAcct;
+
+    // ── 선계산: 호기별 예상 생산량(prod) → 공통설비 배분 비율(생산량 비율) + 라미 판정 ──
+    function planProd(ln) {
+      var b = monthRec.lines[ln] || { prod: 0 };
+      var o = overrides[ln] || {};
+      return (o.prod != null) ? +o.prod : (+b.prod || 0);
+    }
+    var prodMap = {}, prodSum = 0;
+    lineList.forEach(function (ln) { var p = planProd(ln); prodMap[ln] = p; prodSum += p; });
+
+    // 공통설비 월별 전력사용량 (override 우선). 현재 전부 0.
+    var baseCommon = monthRec.common || { toc: 0, edi: 0, boilerNox: 0, energyReuse: 0 };
+    var ovCommon = overrides.common || {};
+    function cpick(k) { return (ovCommon[k] != null) ? +ovCommon[k] : (+baseCommon[k] || 0); }
+    var common = { toc: cpick('toc'), edi: cpick('edi'), boilerNox: cpick('boilerNox'), energyReuse: cpick('energyReuse') };
+    var commonTotal = common.toc + common.edi + common.boilerNox + common.energyReuse; // 폐수+스팀 모두 생산량비율 배분
+
+    // 라미네이팅 고정값: 제지2·제지3 가동(prod>0) 여부로 결정
+    var lamiSet = {}, lamiFixed = 0;
+    if (lami && lami.lines && lami.lines.length) {
+      var onCnt = (lami.paperRefs || []).filter(function (ref) { return (prodMap[ref] || 0) > 0; }).length;
+      lamiFixed = (onCnt >= 2) ? +lami.both : (onCnt === 1 ? +lami.one : 0);
+      lami.lines.forEach(function (ln) { lamiSet[ln] = true; });
+    }
 
     // 일자(평일/토요일/휴일) — override 우선
     var baseDays = monthRec.days || { weekday: 0, sat: 0, holiday: 0 };
@@ -77,18 +102,28 @@ var PowerCalc = (function () {
 
       var baseUsageMo = (base.usageMo != null) ? +base.usageMo : (+base.usage || 0);
       var baseUsageEss = (base.usageEss != null) ? +base.usageEss : 0;
+      var isLami = !!lamiSet[ln];
 
-      // ① 모고객 사용량 결정 (A방식)
-      var usageMo, usageMode;
-      if (ov.usage != null) {                              // 직접 usage override(예외 케이스): 전체를 모고객 취급
-        usageMo = +ov.usage; usageMode = 'direct';
+      // ① 모고객 = moBase + moCommon + moLami
+      //   moBase: 호기별 A방식(가동시간 비례). 라미 호기는 A방식 대신 고정값(moLami) 사용 → moBase=0
+      var moBase = 0, usageMode;
+      if (isLami) {
+        moBase = 0; usageMode = 'lami';
+      } else if (ov.usage != null) {                       // 직접 usage override(예외): 전체를 모고객 취급
+        moBase = +ov.usage; usageMode = 'direct';
       } else if (baseHours != null && baseHours > 0) {     // A방식: 가동시간 비례
         var perHour = baseUsageMo / baseHours;             // 시간당 모고객 전력 (실적 계수)
-        usageMo = perHour * (planHours != null ? planHours : baseHours);
+        moBase = perHour * (planHours != null ? planHours : baseHours);
         usageMode = 'A';
       } else {                                             // B방식 fallback: 실적 모고객 사용량 그대로
-        usageMo = baseUsageMo; usageMode = 'B';
+        moBase = baseUsageMo; usageMode = 'B';
       }
+      //   moCommon: 공통설비 배분 = 공통설비합 × 생산량비율 (라미 호기 제외, 현재 공통설비 0)
+      var moCommon = (!isLami && prodSum > 0) ? (commonTotal * (prod / prodSum)) : 0;
+      //   moLami: 라미네이팅 고정값
+      var moLami = isLami ? lamiFixed : 0;
+
+      var usageMo = moBase + moCommon + moLami;
 
       // ② ESS 사용량 (충전식): essGuarantee × (평일+토) × essEff
       var guarantee = +essGuarantee[ln] || 0;
@@ -115,16 +150,22 @@ var PowerCalc = (function () {
       r.usageMode = usageMode;
       r.essMode = essMode;
       r.usageMo = usageMo;
+      r.moBase = moBase;
+      r.moCommon = moCommon;
+      r.moLami = moLami;
+      r.isLami = isLami;
       r.usageEss = usageEss;
       r.essGuarantee = guarantee;
       return r;
     });
 
-    // 합계: 전력비 총액, 사용량(모고객/ESS/합계)
+    // 합계: 전력비 총액, 사용량(모고객/ESS/합계 + 모고객 구성요소)
     var totals = rows.reduce(function (s, r) {
       s.usage += r.usage; s.usageMo += r.usageMo; s.usageEss += r.usageEss; s.cost += r.cost;
+      s.moBase += r.moBase; s.moCommon += r.moCommon; s.moLami += r.moLami;
       return s;
-    }, { usage: 0, usageMo: 0, usageEss: 0, cost: 0 });
+    }, { usage: 0, usageMo: 0, usageEss: 0, cost: 0, moBase: 0, moCommon: 0, moLami: 0 });
+    totals.common = common; totals.commonTotal = commonTotal; totals.lamiFixed = lamiFixed;
 
     // 제지/화장지(paper) 군의 톤당 전력비 (가중)
     var paperRows = rows.filter(function (r) { return r.type === 'paper'; });
