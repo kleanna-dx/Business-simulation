@@ -37,6 +37,32 @@ var TITLES = {
 
 var App = { state: { route: 'dashboard', simYear: null } };
 
+/* ====================== 실적/예상 기준일(Cutoff) ======================
+   현재일 기준으로 "전달까지"는 실적(SAP, 확정·수정 금지),
+   "현재달부터"는 예상(이동계획, 입력·예측 적용).
+   예) 2026-05-31 → 2026-01~04 실적, 2026-05~ 예상.
+   - 데모는 2026년 데이터이므로, 실제 today가 2026이 아니면
+     '?asof=YYYY-MM' 파라미터로 기준월을 덮어쓸 수 있다(데모/검증용). */
+var Period = {
+  // 기준월(현재월) 'YYYY-MM'. 이 달 포함 이후가 예상.
+  cutoff: (function () {
+    try {
+      var q = new URLSearchParams(location.search);
+      var asof = q.get('asof');
+      if (asof && /^\d{4}-\d{1,2}$/.test(asof)) {
+        var p = asof.split('-'); return p[0] + '-' + ('0' + p[1]).slice(-2);
+      }
+    } catch (e) {}
+    var d = new Date();
+    return d.getFullYear() + '-' + ('0' + (d.getMonth() + 1)).slice(-2);
+  })(),
+  // month < cutoff → 실적 확정(과거)
+  isActual: function (month) { return !!month && month < this.cutoff; },
+  // month >= cutoff → 예상(현재월 포함 미래)
+  isForecast: function (month) { return !!month && month >= this.cutoff; },
+  label: function (month) { return this.isActual(month) ? '실적 확정' : '예상(이동계획)'; }
+};
+
 function el(html) { var d = document.createElement('div'); d.innerHTML = html.trim(); return d.firstChild; }
 function $(sel, root) { return (root || document).querySelector(sel); }
 function $all(sel, root) { return Array.prototype.slice.call((root || document).querySelectorAll(sel)); }
@@ -595,6 +621,7 @@ var ProdPlan = {
       if (!r.month || !r.line) { skipped++; return; }
       if (PowerDB.lines.indexOf(r.line) < 0) { skipped++; return; }
       if (PowerDB.months.indexOf(r.month) < 0) { skipped++; return; }
+      if (typeof Period !== 'undefined' && Period.isActual(r.month)) { skipped++; return; } // 실적 확정월 — 업로드 무시
       if (!self.plan[r.month]) self.plan[r.month] = {};
       if (!self.plan[r.month][r.line]) self.plan[r.month][r.line] = {};
       var any = false;
@@ -612,8 +639,14 @@ var ProdPlanState = { month: null };
 
 var PowerState = { month: null, price: null };
 
+// 기본 표시 월: 기준월(현재월)이 데이터에 있으면 그 달, 없으면 첫 달
+function defaultMonth() {
+  if (PowerDB.months && PowerDB.months.indexOf(Period.cutoff) >= 0) return Period.cutoff;
+  return (PowerDB.months || [])[0];
+}
+
 function powerCurrentMonthRec() {
-  var m = PowerState.month || (PowerDB.months[0]);
+  var m = PowerState.month || defaultMonth();
   return { key: m, rec: (PowerDB.byMonth || {})[m] };
 }
 
@@ -621,12 +654,13 @@ PAGES.power = function () {
   if (!PowerDB.hasData()) return emptyState('전력비 실적 데이터가 없습니다. 운영에서는 SAP/엑셀 연동 후 호기별 전력 실적이 표시됩니다.');
 
   var monthOpts = PowerDB.months.map(function (m) {
-    var sel = (m === (PowerState.month || PowerDB.months[0])) ? ' selected' : '';
-    var label = m.replace('-', '년 ') + '월';
+    var sel = (m === (PowerState.month || defaultMonth())) ? ' selected' : '';
+    var label = m.replace('-', '년 ') + '월' + (Period.isActual(m) ? ' · 실적' : ' · 예상');
     return '<option value="' + m + '"' + sel + '>' + label + '</option>';
   }).join('');
 
   var cur = powerCurrentMonthRec();
+  var curIsActual = Period.isActual(cur.key);
   var price = (PowerState.price != null) ? PowerState.price : (cur.rec ? cur.rec.priceAcct : 0);
 
   var stepper = '<div class="stepper">'
@@ -638,10 +672,11 @@ PAGES.power = function () {
   var planSetCnt = PowerDB.lines.filter(function (ln) { return ProdPlan.isAnySet(cur.key, ln); }).length;
   var controls = '<div class="card"><div class="card__head"><h3><i class="fas fa-bolt" style="color:var(--blue);margin-right:7px"></i>시뮬레이션 입력</h3>'
     + '<div class="grow"></div>' + tag('실적 기반', 'INBOUND') + '</div><div class="card__body">'
-    + '<div class="field" style="margin-bottom:14px"><label style="display:block;font-size:12px;color:var(--muted);margin-bottom:5px">대상 월</label>'
+    + '<div class="field" style="margin-bottom:12px"><label style="display:block;font-size:12px;color:var(--muted);margin-bottom:5px">대상 월 <span style="color:var(--muted-2);font-size:11px">(기준월: ' + Period.cutoff.replace('-', '.') + ' · 전달까지 실적)</span></label>'
     + '<select id="pw_month" style="width:100%;padding:9px 11px;border:1px solid var(--border-2);border-radius:8px;font-family:inherit">' + monthOpts + '</select></div>'
+    + '<div id="pw_period" class="note" style="margin-bottom:12px;border-color:' + (curIsActual ? 'var(--muted-2,#94a3b8)' : 'var(--blue,#2563eb)') + ';color:' + (curIsActual ? 'var(--muted,#64748b)' : 'var(--blue-700,#1d4ed8)') + '"></div>'
     + '<div class="field" style="margin-bottom:6px"><label style="display:block;font-size:12px;color:var(--muted);margin-bottom:5px">전력단가 (회계비용 기준) [원/kWh]</label>'
-    + '<input id="pw_price" type="number" step="0.01" value="' + price.toFixed(2) + '" style="width:100%;padding:9px 11px;border:1px solid var(--border-2);border-radius:8px;font-family:inherit;text-align:right"></div>'
+    + '<input id="pw_price" type="number" step="0.01" value="' + price.toFixed(2) + '"' + (curIsActual ? ' disabled title="실적 확정월은 단가 조정 불가"' : '') + ' style="width:100%;padding:9px 11px;border:1px solid var(--border-2);border-radius:8px;font-family:inherit;text-align:right' + (curIsActual ? ';background:#f1f5f9;color:#94a3b8' : '') + '"></div>'
     + '<div class="note" style="margin:12px 0"><i class="fas fa-circle-info"></i> 생산량·가동시간은 <b>예상 생산량 기준정보</b> 탭에서 입력합니다. 이 화면은 그 값을 자동 반영합니다. '
     + '<br>전력사용량은 <b>가동시간 비례(A방식)</b>로 예측됩니다. '
     + (planSetCnt > 0 ? '<b style="color:var(--blue-700)">(예상값 ' + planSetCnt + '개 호기 적용 중)</b>' : '<span style="color:var(--muted-2)">(현재 실적값 사용)</span>') + '</div>'
@@ -669,15 +704,28 @@ PAGES.power = function () {
 function powerRender() {
   var cur = powerCurrentMonthRec();
   if (!cur.rec) return;
-  // 생산량·가동시간은 ProdPlan(예상 생산량 기준정보)에서 자동 반영 — 이 화면에서는 읽기 전용
+  // 실적 확정월(과거)은 SAP 실적 그대로 — ProdPlan 예상값을 적용하지 않는다(수정 금지).
+  // 예상월(현재월 이후)만 ProdPlan(예상 생산량 기준정보)을 자동 반영(A방식).
+  var isActual = Period.isActual(cur.key);
   var ov = {};
-  PowerDB.lines.forEach(function (ln) {
-    var o = {};
-    var p = ProdPlan.get(cur.key, ln, 'prod'); if (p != null) o.prod = p;
-    var h = ProdPlan.get(cur.key, ln, 'hours'); if (h != null) o.hours = h;
-    ov[ln] = o;
-  });
-  if (PowerState.price != null) ov.price = PowerState.price;
+  if (!isActual) {
+    PowerDB.lines.forEach(function (ln) {
+      var o = {};
+      var p = ProdPlan.get(cur.key, ln, 'prod'); if (p != null) o.prod = p;
+      var h = ProdPlan.get(cur.key, ln, 'hours'); if (h != null) o.hours = h;
+      ov[ln] = o;
+    });
+    if (PowerState.price != null) ov.price = PowerState.price;
+  }
+  // 기간 배너 갱신
+  var pb = $('#pw_period');
+  if (pb) {
+    pb.innerHTML = isActual
+      ? '<i class="fas fa-lock"></i> <b>' + cur.key.replace('-', '.') + '</b> 은(는) <b>실적 확정월</b>입니다. SAP 실적이 그대로 표시되며 예상값/단가 조정은 적용되지 않습니다.'
+      : '<i class="fas fa-wand-magic-sparkles"></i> <b>' + cur.key.replace('-', '.') + '</b> 은(는) <b>예상월</b>입니다. 예상 생산량 기준정보(이동계획) + 가동시간 비례(A방식)로 예측됩니다.';
+    pb.style.borderColor = isActual ? 'var(--muted-2,#94a3b8)' : 'var(--blue,#2563eb)';
+    pb.style.color = isActual ? 'var(--muted,#64748b)' : 'var(--blue-700,#1d4ed8)';
+  }
   var res = PowerCalc.computeMonth(cur.rec, PowerDB.lines, PowerDB.lineType, ov);
 
   // KPIs
@@ -757,7 +805,7 @@ AFTER.power = function () {
    - 생산성 = 생산량 ÷ (가동시간 ÷ 24) [표시단위/일]
    - 입력 안 한 항목은 실적값 그대로 사용 */
 function prodplanCurrentMonth() {
-  return ProdPlanState.month || (PowerDB.months[0]);
+  return ProdPlanState.month || defaultMonth();
 }
 // 표시단위/입력단위 환산: 제지·화장지=톤(=kg/1000), 가공·생리대=천개(=EA/1000), 라미네이팅=EA(환산 1)
 function ppDispUnit(ln) { return (PowerDB.unit && PowerDB.unit[ln]) || ((PowerDB.lineType[ln] === 'paper') ? '톤' : 'EA'); }
@@ -772,10 +820,11 @@ PAGES.prodplan = function () {
 
   var monthOpts = PowerDB.months.map(function (m) {
     var sel = (m === prodplanCurrentMonth()) ? ' selected' : '';
-    return '<option value="' + m + '"' + sel + '>' + m.replace('-', '년 ') + '월</option>';
+    return '<option value="' + m + '"' + sel + '>' + m.replace('-', '년 ') + '월' + (Period.isActual(m) ? ' · 실적' : ' · 예상') + '</option>';
   }).join('');
 
   var cur = prodplanCurrentMonth();
+  var curIsActual = Period.isActual(cur);
   var setCnt = PowerDB.lines.filter(function (ln) { return ProdPlan.isAnySet(cur, ln); }).length;
 
   var head = '<div class="card"><div class="card__head"><h3><i class="fas fa-industry" style="color:var(--blue);margin-right:7px"></i>예상 생산량 기준정보 (이동계획)</h3>'
@@ -783,13 +832,17 @@ PAGES.prodplan = function () {
     + '<div class="note" style="margin-bottom:14px"><i class="fas fa-circle-info"></i> 호기별 <b>예상 생산량</b>과 <b>가동시간</b>을 입력하면 전력비 등 모든 원가 시뮬레이션의 공통 기준이 됩니다. '
     + '<b>생산성(생산량/일)</b>은 자동 계산되며, 비워둔 항목은 <b>실적값</b>을 그대로 사용합니다.<br>'
     + '전력사용량은 <b>가동시간 비례(A방식)</b>로 예측됩니다: 시간당 전력(실적) × 예상 가동시간.</div>'
+    + '<div class="note" style="margin-bottom:14px;border-color:' + (curIsActual ? 'var(--muted-2,#94a3b8)' : 'var(--blue,#2563eb)') + ';color:' + (curIsActual ? 'var(--muted,#64748b)' : 'var(--blue-700,#1d4ed8)') + '">'
+    + (curIsActual
+        ? '<i class="fas fa-lock"></i> <b>' + cur.replace('-', '.') + '</b> 은(는) <b>실적 확정월</b>입니다(기준월 ' + Period.cutoff.replace('-', '.') + ' 전달까지). SAP 실적이며 <b>입력/수정이 금지</b>됩니다.'
+        : '<i class="fas fa-pen-to-square"></i> <b>' + cur.replace('-', '.') + '</b> 은(는) <b>예상월</b>입니다(기준월 ' + Period.cutoff.replace('-', '.') + ' 포함 이후). 이동계획에 따라 자유롭게 입력하세요.') + '</div>'
     + '<div class="grid" style="grid-template-columns:1fr 1fr;gap:12px">'
     + '<div class="field"><label style="display:block;font-size:12px;color:var(--muted);margin-bottom:5px">대상 월</label>'
     + '<select id="pp_month" style="width:100%;padding:9px 11px;border:1px solid var(--border-2);border-radius:8px;font-family:inherit">' + monthOpts + '</select></div>'
     + '<div class="field" style="display:flex;align-items:flex-end;gap:8px">'
     + '<button class="btn" style="flex:1" id="pp_template"><i class="fas fa-download"></i> 엑셀 양식 받기</button>'
-    + '<label class="btn btn-primary" style="flex:1;text-align:center;cursor:pointer;margin:0"><i class="fas fa-file-import"></i> 엑셀 업로드'
-    + '<input type="file" id="pp_file" accept=".xlsx,.xls,.csv" style="display:none"></label></div>'
+    + '<label class="btn btn-primary" style="flex:1;text-align:center;cursor:pointer;margin:0' + (curIsActual ? ';opacity:.45;pointer-events:none' : '') + '"><i class="fas fa-file-import"></i> 엑셀 업로드'
+    + '<input type="file" id="pp_file" accept=".xlsx,.xls,.csv" style="display:none"' + (curIsActual ? ' disabled' : '') + '></label></div>'
     + '</div>'
     + '<div id="pp_uploadmsg" style="margin-top:10px"></div>'
     + '</div></div>';
@@ -798,8 +851,8 @@ PAGES.prodplan = function () {
 
   var tbl = '<div class="card" style="margin-top:16px"><div class="card__head"><h3>호기별 예상 생산량·가동시간 입력 <span style="font-size:12px;color:var(--muted)">(' + cur.replace('-', '.') + ')</span></h3>'
     + '<div class="grow"></div>'
-    + '<span id="pp_setbadge">' + (setCnt > 0 ? tag('예상값 ' + setCnt + '개 호기', 'TRANSFER') : tag('전부 실적값', 'SHIPMENT')) + '</span>'
-    + '<button class="btn" id="pp_resetmonth" style="margin-left:9px"><i class="fas fa-rotate-left"></i> 이 달 전체 실적값으로</button>'
+    + '<span id="pp_setbadge">' + (curIsActual ? tag('실적 확정', 'INBOUND') : (setCnt > 0 ? tag('예상값 ' + setCnt + '개 호기', 'TRANSFER') : tag('전부 실적값', 'SHIPMENT'))) + '</span>'
+    + (curIsActual ? '' : '<button class="btn" id="pp_resetmonth" style="margin-left:9px"><i class="fas fa-rotate-left"></i> 이 달 전체 실적값으로</button>')
     + '</div>'
     + '<div class="tbl-wrap" style="border:none;border-radius:0"><table class="tbl"><thead><tr>'
     + '<th>호기</th><th>항목</th><th class="num">단위</th><th class="num">실적</th><th class="num">예상 (입력)</th><th class="num">증감</th>'
@@ -819,6 +872,9 @@ function ppActiveLine(month, ln) {
 
 function prodplanRenderTable() {
   var cur = prodplanCurrentMonth();
+  var locked = Period.isActual(cur); // 실적 확정월 → 입력 비활성
+  var lockAttr = locked ? ' disabled title="실적 확정월 — 수정 금지"' : '';
+  var lockStyle = locked ? ';background:#f1f5f9;color:#94a3b8;cursor:not-allowed' : '';
   var html = '';
   var lastGroup = null;
 
@@ -871,16 +927,16 @@ function prodplanRenderTable() {
       + '<td>생산량</td>'
       + '<td class="num"><span style="color:var(--muted-2);font-size:11px">' + unit + '</span></td>'
       + '<td class="num">' + (actProdDisp != null ? pfmt.int(actProdDisp) : '-') + '</td>'
-      + '<td class="num"><input type="number" class="pp_in" data-line="' + ln + '" data-field="prod" value="' + (planProdDisp === '' ? '' : planProdDisp) + '" placeholder="' + (actProdDisp != null ? pfmt.int(actProdDisp) : '') + '" '
-      + 'style="width:120px;padding:5px 8px;border:1px solid var(--border-2);border-radius:7px;font-family:inherit;text-align:right;font-size:12.5px"></td>'
+      + '<td class="num"><input type="number" class="pp_in" data-line="' + ln + '" data-field="prod" value="' + (planProdDisp === '' ? '' : planProdDisp) + '" placeholder="' + (actProdDisp != null ? pfmt.int(actProdDisp) : '') + '"' + lockAttr + ' '
+      + 'style="width:120px;padding:5px 8px;border:1px solid var(--border-2);border-radius:7px;font-family:inherit;text-align:right;font-size:12.5px' + lockStyle + '"></td>'
       + '<td class="pp-delta-prod">' + prodDeltaCell + '</td></tr>';
     // 행2: 가동시간
     html += '<tr data-line="' + ln + '">'
       + '<td>가동시간</td>'
       + '<td class="num"><span style="color:var(--muted-2);font-size:11px">Hr</span></td>'
       + '<td class="num">' + (actHours != null ? pfmt.int(actHours) : '<span style="color:var(--muted-2);font-size:11px">N/A</span>') + '</td>'
-      + '<td class="num"><input type="number" class="pp_in" data-line="' + ln + '" data-field="hours" value="' + (planHoursVal === '' ? '' : planHoursVal) + '" placeholder="' + (actHours != null ? pfmt.int(actHours) : '') + '" '
-      + 'style="width:120px;padding:5px 8px;border:1px solid var(--border-2);border-radius:7px;font-family:inherit;text-align:right;font-size:12.5px"></td>'
+      + '<td class="num"><input type="number" class="pp_in" data-line="' + ln + '" data-field="hours" value="' + (planHoursVal === '' ? '' : planHoursVal) + '" placeholder="' + (actHours != null ? pfmt.int(actHours) : '') + '"' + lockAttr + ' '
+      + 'style="width:120px;padding:5px 8px;border:1px solid var(--border-2);border-radius:7px;font-family:inherit;text-align:right;font-size:12.5px' + lockStyle + '"></td>'
       + '<td class="pp-delta-hours">' + hoursDeltaCell + '</td></tr>';
     // 행3: 생산성(자동)
     html += '<tr data-line="' + ln + '" style="background:var(--bg-1,#fafbfc)">'
@@ -1028,6 +1084,7 @@ AFTER.prodplan = function () {
 
   var file = $('#pp_file');
   if (file) file.addEventListener('change', function () {
+    if (Period.isActual(prodplanCurrentMonth())) { file.value = ''; return; } // 실적월 업로드 차단
     if (file.files && file.files[0]) prodplanHandleFile(file.files[0]);
     file.value = '';
   });
@@ -1046,6 +1103,7 @@ AFTER.prodplan = function () {
     var ln = inp.getAttribute('data-line');
     var field = inp.getAttribute('data-field');
     var cur = prodplanCurrentMonth();
+    if (Period.isActual(cur)) return; // 실적 확정월 — 입력 무시(수정 금지)
     // 저장: 생산량은 표시단위→내부단위, 가동시간은 그대로
     var storeVal = (field === 'prod') ? ppToInternal(ln, inp.value) : (inp.value === '' ? null : +inp.value);
     ProdPlan.set(cur, ln, field, storeVal);
