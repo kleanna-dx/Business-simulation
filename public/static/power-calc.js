@@ -29,20 +29,44 @@ var PowerCalc = (function () {
   }
 
   // 한 달 전체 호기 계산
-  // month: { priceAcct, lines:{ 호기:{usage,prod} } }, lineList: [...], lineType:{호기:type}
-  // overrides: { 호기: {prod?, usage?}, price? }  (시뮬레이션 입력값)
+  // month: { priceAcct, lines:{ 호기:{usage,prod,hours} } }, lineList: [...], lineType:{호기:type}
+  // overrides: { 호기: {prod?, hours?, usage?}, price? }  (시뮬레이션 입력값)
+  //
+  // 전력사용량 예측 (A방식, 가동시간 비례):
+  //   시간당전력[kWh/Hr] = 실적 usage / 실적 hours  (실적 고정 계수)
+  //   예상 usage = 시간당전력 × 예상 hours(입력)
+  //   ※ 실적 hours가 없으면(=null) A방식 계수를 못 구하므로 → B방식 fallback(실적 usage 그대로)
   function computeMonth(monthRec, lineList, lineType, overrides) {
     overrides = overrides || {};
     var price = (overrides.price != null) ? +overrides.price : monthRec.priceAcct;
     var rows = lineList.map(function (ln) {
-      var base = monthRec.lines[ln] || { usage: 0, prod: 0 };
+      var base = monthRec.lines[ln] || { usage: 0, prod: 0, hours: null };
       var ov = overrides[ln] || {};
-      var usage = (ov.usage != null) ? +ov.usage : base.usage;
+      var baseHours = (base.hours != null) ? +base.hours : null;
       var prod = (ov.prod != null) ? +ov.prod : base.prod;
+
+      // 예상 가동시간: 입력값 있으면 그 값, 없으면 실적 가동시간
+      var planHours = (ov.hours != null) ? +ov.hours : baseHours;
+
+      // 전력사용량 결정
+      var usage, usageMode;
+      if (ov.usage != null) {                       // 직접 usage override(예외 케이스)
+        usage = +ov.usage; usageMode = 'direct';
+      } else if (baseHours != null && baseHours > 0) {  // A방식: 가동시간 비례
+        var perHour = base.usage / baseHours;        // 시간당 전력 (실적 계수)
+        usage = perHour * (planHours != null ? planHours : baseHours);
+        usageMode = 'A';
+      } else {                                       // B방식 fallback: 실적 usage 그대로
+        usage = base.usage; usageMode = 'B';
+      }
+
       var r = computeLine(usage, prod, price, lineType[ln]);
       r.line = ln;
       r.baseProd = base.prod;
       r.baseUsage = base.usage;
+      r.baseHours = baseHours;
+      r.planHours = planHours;
+      r.usageMode = usageMode;
       return r;
     });
     // 합계: 전력비 총액, 사용량 (생산량은 단위가 섞여 합산 의미 제한적)

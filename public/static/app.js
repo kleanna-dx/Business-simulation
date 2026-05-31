@@ -511,21 +511,23 @@ PAGES.approval = function () {
    PowerDB는 운영에서 PowerDB.load(payload)로 채움. */
 var PowerDB = (typeof DEMO_MODE !== 'undefined' && DEMO_MODE && typeof POWER_DEMO !== 'undefined')
   ? POWER_DEMO
-  : { lines: [], months: [], lineType: {}, byMonth: {} };
+  : { lines: [], months: [], lineType: {}, byMonth: {}, unit: {}, group: {} };
 PowerDB.hasData = function () { return this.months && this.months.length > 0; };
 PowerDB.load = function (payload) {
   if (!payload) return this;
   var self = this;
-  ['lines', 'months', 'lineType', 'byMonth'].forEach(function (k) { if (payload[k] != null) self[k] = payload[k]; });
+  ['lines', 'months', 'lineType', 'byMonth', 'unit', 'group'].forEach(function (k) { if (payload[k] != null) self[k] = payload[k]; });
   return this;
 };
 
 /* ====================== 예상 생산량 기준정보 (전역 공유) ======================
-   ProdPlan.plan[month][line] = 예상생산량 (사용자 입력/엑셀 업로드).
-   값이 없으면 PowerDB의 실적 생산량을 fallback으로 사용.
-   전력비·(추후)재료비 등 모든 시뮬레이션이 이 값을 공유한다. */
+   ProdPlan.plan[month][line] = { prod?, hours? }  (예상 생산량 / 예상 가동시간)
+   - 항목별로 입력값이 있으면 그 값, 없으면 PowerDB의 실적값을 fallback.
+   - 생산성(생산량/일) = 생산량 ÷ (가동시간 ÷ 24)  → 자동 계산(저장 안 함)
+   - 전력비(A방식): 시간당전력 × 예상가동시간 → 예상사용량, ÷예상생산량 → 원단위
+   - 전력비·(추후)재료비 등 모든 시뮬레이션이 이 값을 공유한다. */
 var ProdPlan = {
-  STORAGE_KEY: 'precost_prodplan_v1',
+  STORAGE_KEY: 'precost_prodplan_v2',
   plan: {},
   loadStorage: function () {
     try {
@@ -536,32 +538,57 @@ var ProdPlan = {
   saveStorage: function () {
     try { localStorage.setItem(this.STORAGE_KEY, JSON.stringify(this.plan)); } catch (e) {}
   },
-  // 실적 생산량 (PowerDB 기준)
-  actual: function (month, line) {
+  // 실적값 (PowerDB 기준). field: 'prod' | 'hours'
+  actual: function (month, line, field) {
     var rec = (PowerDB.byMonth || {})[month];
-    if (rec && rec.lines && rec.lines[line]) return rec.lines[line].prod || 0;
-    return 0;
+    if (rec && rec.lines && rec.lines[line]) {
+      var v = rec.lines[line][field];
+      return (v == null) ? null : v;
+    }
+    return null;
   },
-  // 예상 생산량 (입력값 있으면 그 값, 없으면 실적값)
-  get: function (month, line) {
-    if (this.plan[month] && this.plan[month][line] != null) return this.plan[month][line];
-    return this.actual(month, line);
+  // 입력 레코드 ({prod?,hours?} 또는 undefined)
+  rec: function (month, line) {
+    return (this.plan[month] && this.plan[month][line]) ? this.plan[month][line] : null;
   },
-  // 입력값이 명시적으로 설정되었는지 (실적과 다른 계획값)
-  isSet: function (month, line) {
-    return !!(this.plan[month] && this.plan[month][line] != null);
+  // 항목이 명시적으로 입력되었는지
+  isSet: function (month, line, field) {
+    var r = this.rec(month, line);
+    return !!(r && r[field] != null);
   },
-  set: function (month, line, val) {
+  // 해당 호기에 (생산량 또는 가동시간 중) 하나라도 입력값이 있는지
+  isAnySet: function (month, line) {
+    return this.isSet(month, line, 'prod') || this.isSet(month, line, 'hours');
+  },
+  // 예상값 (입력값 있으면 그 값, 없으면 실적값). field: 'prod' | 'hours'
+  get: function (month, line, field) {
+    var r = this.rec(month, line);
+    if (r && r[field] != null) return r[field];
+    return this.actual(month, line, field);
+  },
+  // 생산성 (생산량/일) = 생산량 ÷ (가동시간/24)
+  productivity: function (month, line) {
+    var prod = this.get(month, line, 'prod');
+    var hours = this.get(month, line, 'hours');
+    if (prod == null || hours == null || hours <= 0) return null;
+    return prod / (hours / 24);
+  },
+  set: function (month, line, field, val) {
     if (!this.plan[month]) this.plan[month] = {};
-    if (val == null || val === '') { delete this.plan[month][line]; }
-    else { this.plan[month][line] = +val; }
+    if (!this.plan[month][line]) this.plan[month][line] = {};
+    if (val == null || val === '') { delete this.plan[month][line][field]; }
+    else { this.plan[month][line][field] = +val; }
+    // 빈 레코드 정리
+    var r = this.plan[month][line];
+    if (r && r.prod == null && r.hours == null) { delete this.plan[month][line]; }
+    if (this.plan[month] && Object.keys(this.plan[month]).length === 0) { delete this.plan[month]; }
     this.saveStorage();
   },
   clearMonth: function (month) {
     delete this.plan[month];
     this.saveStorage();
   },
-  // 엑셀 업로드 결과 일괄 반영: rows = [{month, line, prod}]
+  // 엑셀 업로드 결과 일괄 반영: rows = [{month, line, prod?, hours?}]
   bulkSet: function (rows) {
     var self = this, applied = 0, skipped = 0;
     rows.forEach(function (r) {
@@ -569,8 +596,11 @@ var ProdPlan = {
       if (PowerDB.lines.indexOf(r.line) < 0) { skipped++; return; }
       if (PowerDB.months.indexOf(r.month) < 0) { skipped++; return; }
       if (!self.plan[r.month]) self.plan[r.month] = {};
-      self.plan[r.month][r.line] = +r.prod || 0;
-      applied++;
+      if (!self.plan[r.month][r.line]) self.plan[r.month][r.line] = {};
+      var any = false;
+      if (r.prod != null && r.prod !== '') { self.plan[r.month][r.line].prod = +r.prod; any = true; }
+      if (r.hours != null && r.hours !== '') { self.plan[r.month][r.line].hours = +r.hours; any = true; }
+      if (any) applied++; else skipped++;
     });
     this.saveStorage();
     return { applied: applied, skipped: skipped };
@@ -605,14 +635,15 @@ PAGES.power = function () {
     + '<div class="step current"><div class="step__dot">3</div><div class="step__lab">생산량 시뮬레이션</div></div><div class="step__line"></div>'
     + '<div class="step"><div class="step__dot">4</div><div class="step__lab">전력비 산출</div></div></div>';
 
-  var planSetCnt = PowerDB.lines.filter(function (ln) { return ProdPlan.isSet(cur.key, ln); }).length;
+  var planSetCnt = PowerDB.lines.filter(function (ln) { return ProdPlan.isAnySet(cur.key, ln); }).length;
   var controls = '<div class="card"><div class="card__head"><h3><i class="fas fa-bolt" style="color:var(--blue);margin-right:7px"></i>시뮬레이션 입력</h3>'
     + '<div class="grow"></div>' + tag('실적 기반', 'INBOUND') + '</div><div class="card__body">'
     + '<div class="field" style="margin-bottom:14px"><label style="display:block;font-size:12px;color:var(--muted);margin-bottom:5px">대상 월</label>'
     + '<select id="pw_month" style="width:100%;padding:9px 11px;border:1px solid var(--border-2);border-radius:8px;font-family:inherit">' + monthOpts + '</select></div>'
     + '<div class="field" style="margin-bottom:6px"><label style="display:block;font-size:12px;color:var(--muted);margin-bottom:5px">전력단가 (회계비용 기준) [원/kWh]</label>'
     + '<input id="pw_price" type="number" step="0.01" value="' + price.toFixed(2) + '" style="width:100%;padding:9px 11px;border:1px solid var(--border-2);border-radius:8px;font-family:inherit;text-align:right"></div>'
-    + '<div class="note" style="margin:12px 0"><i class="fas fa-circle-info"></i> 생산량은 <b>예상 생산량 기준정보</b> 탭에서 입력합니다. 이 화면은 그 값을 자동 반영합니다. '
+    + '<div class="note" style="margin:12px 0"><i class="fas fa-circle-info"></i> 생산량·가동시간은 <b>예상 생산량 기준정보</b> 탭에서 입력합니다. 이 화면은 그 값을 자동 반영합니다. '
+    + '<br>전력사용량은 <b>가동시간 비례(A방식)</b>로 예측됩니다. '
     + (planSetCnt > 0 ? '<b style="color:var(--blue-700)">(예상값 ' + planSetCnt + '개 호기 적용 중)</b>' : '<span style="color:var(--muted-2)">(현재 실적값 사용)</span>') + '</div>'
     + '<button class="btn" style="width:100%" onclick="location.hash=\'prodplan\'"><i class="fas fa-industry"></i> 예상 생산량 기준정보 편집</button>'
     + '<hr class="hr">'
@@ -624,7 +655,7 @@ PAGES.power = function () {
   var tbl = '<div class="card"><div class="card__head"><h3>호기별 전력비 상세</h3><div class="grow"></div>'
     + '<span class="legend"><span class="l">' + tag('제지/화장지', 'TRANSFER') + 'kWh/ton</span><span class="l">' + tag('가공/생리대', 'SHIPMENT') + 'kWh/개</span></span></div>'
     + '<div class="tbl-wrap" style="border:none;border-radius:0"><table class="tbl"><thead><tr>'
-    + '<th>호기</th><th class="num">전력사용량 [kWh]</th><th class="num">생산량</th><th class="num">전력원단위</th>'
+    + '<th>호기</th><th class="num">가동시간 [Hr]</th><th class="num">전력사용량 [kWh]</th><th class="num">생산량</th><th class="num">전력원단위</th>'
     + '<th class="num">전력비원단위</th><th class="num">전력비 [원]</th><th>변동</th>'
     + '</tr></thead><tbody id="pwTbody"></tbody></table></div></div>';
 
@@ -638,10 +669,13 @@ PAGES.power = function () {
 function powerRender() {
   var cur = powerCurrentMonthRec();
   if (!cur.rec) return;
-  // 생산량은 ProdPlan(예상 생산량 기준정보)에서 자동 반영 — 이 화면에서는 읽기 전용
+  // 생산량·가동시간은 ProdPlan(예상 생산량 기준정보)에서 자동 반영 — 이 화면에서는 읽기 전용
   var ov = {};
   PowerDB.lines.forEach(function (ln) {
-    ov[ln] = { prod: ProdPlan.get(cur.key, ln) };
+    var o = {};
+    var p = ProdPlan.get(cur.key, ln, 'prod'); if (p != null) o.prod = p;
+    var h = ProdPlan.get(cur.key, ln, 'hours'); if (h != null) o.hours = h;
+    ov[ln] = o;
   });
   if (PowerState.price != null) ov.price = PowerState.price;
   var res = PowerCalc.computeMonth(cur.rec, PowerDB.lines, PowerDB.lineType, ov);
@@ -662,21 +696,31 @@ function powerRender() {
     var unitU = isPaper ? 'kWh/ton' : 'kWh/개';
     var costU = isPaper ? '천원/ton' : '원/개';
     var prodU = isPaper ? 'kg' : 'EA';
-    // 변동: 생산량이 실적과 다른지
-    var changed = Math.abs(r.prod - r.baseProd) > 0.5;
+    // 변동: 생산량 또는 가동시간이 실적과 다른지
+    var prodChanged = Math.abs(r.prod - r.baseProd) > 0.5;
+    var hoursChanged = (r.planHours != null && r.baseHours != null) ? (Math.abs(r.planHours - r.baseHours) > 0.05) : false;
     var deltaPct = r.baseProd > 0 ? ((r.prod - r.baseProd) / r.baseProd * 100) : 0;
-    var deltaCell = changed
-      ? '<span class="tag ' + (deltaPct >= 0 ? 'tag-up' : 'tag-down') + '">' + (deltaPct >= 0 ? '+' : '') + deltaPct.toFixed(1) + '%</span>'
-      : '<span style="color:var(--muted-2);font-size:11px">실적</span>';
+    var deltaCell;
+    if (prodChanged || hoursChanged) {
+      deltaCell = '<span class="tag ' + (deltaPct >= 0 ? 'tag-up' : 'tag-down') + '">' + (deltaPct >= 0 ? '+' : '') + deltaPct.toFixed(1) + '%</span>';
+    } else {
+      deltaCell = '<span style="color:var(--muted-2);font-size:11px">실적</span>';
+    }
+    // 가동시간 셀 (B방식 fallback이면 표시)
+    var hoursCell = (r.planHours != null)
+      ? pfmt.dec(r.planHours, 0)
+      : '<span style="color:var(--muted-2);font-size:11px" title="실적 가동시간 없음 → 생산량 기준(B방식)">N/A</span>';
+    var modeBadge = (r.usageMode === 'B') ? ' <span class="cell-code" title="가동시간 실적 없음: 실적 전력사용량 그대로 사용">B</span>' : '';
     return '<tr><td><b>' + r.line + '</b> <span class="cell-code">' + (isPaper ? 'PAPER' : 'PROC') + '</span></td>'
-      + '<td class="num">' + pfmt.int(r.usage) + '</td>'
+      + '<td class="num">' + hoursCell + '</td>'
+      + '<td class="num">' + pfmt.int(r.usage) + modeBadge + '</td>'
       + '<td class="num">' + pfmt.int(r.prod) + ' <span style="color:var(--muted-2);font-size:10px">' + prodU + '</span></td>'
       + '<td class="num">' + pfmt.dec(r.unit, isPaper ? 2 : 4) + ' <span style="color:var(--muted-2);font-size:10px">' + unitU + '</span></td>'
       + '<td class="num">' + pfmt.dec(r.costUnit, isPaper ? 2 : 4) + ' <span style="color:var(--muted-2);font-size:10px">' + costU + '</span></td>'
       + '<td class="num"><b>' + pfmt.won(r.cost) + '</b></td>'
       + '<td>' + deltaCell + '</td></tr>';
   }).join('')
-    + '<tr class="row-total"><td>합계</td><td class="num">' + pfmt.int(res.totals.usage) + '</td>'
+    + '<tr class="row-total"><td>합계</td><td class="num">-</td><td class="num">' + pfmt.int(res.totals.usage) + '</td>'
     + '<td class="num">-</td><td class="num">-</td><td class="num">-</td>'
     + '<td class="num">' + pfmt.won(res.totals.cost) + '</td><td>-</td></tr>';
 }
@@ -706,13 +750,25 @@ AFTER.power = function () {
   powerRender();
 };
 
-/* ====================== 예상 생산량 기준정보 화면 (#prodplan) ====================== */
+/* ====================== 예상 생산량 기준정보 화면 (#prodplan) ======================
+   - 호기별 3행: 생산량 / 가동시간(Hr) / 생산성(생산량/일, 자동)
+   - 생산량 단위는 호기별로 다름(제지·화장지=톤, 가공·생리대=천개, 라미네이팅=EA)
+     · 내부(PowerDB)는 kg/EA 단위 → 화면/입력은 표시단위(÷1000) 기준, 저장 시 내부단위로 변환
+   - 생산성 = 생산량 ÷ (가동시간 ÷ 24) [표시단위/일]
+   - 입력 안 한 항목은 실적값 그대로 사용 */
 function prodplanCurrentMonth() {
   return ProdPlanState.month || (PowerDB.months[0]);
 }
+// 표시단위/입력단위 환산: 제지·화장지=톤(=kg/1000), 가공·생리대=천개(=EA/1000), 라미네이팅=EA(환산 1)
+function ppDispUnit(ln) { return (PowerDB.unit && PowerDB.unit[ln]) || ((PowerDB.lineType[ln] === 'paper') ? '톤' : 'EA'); }
+function ppFactor(ln) { var u = ppDispUnit(ln); return (u === '톤' || u === '천개') ? 1000 : 1; } // 내부 = 표시 × factor
+function ppToDisp(ln, internal) { if (internal == null) return null; return internal / ppFactor(ln); }
+function ppToInternal(ln, disp) { if (disp == null || disp === '') return null; return (+disp) * ppFactor(ln); }
+// 그룹 순서·소계용
+var PP_GROUP_ORDER = ['제지', '화장지', '가공', '생리대', '라미네이팅'];
 
 PAGES.prodplan = function () {
-  if (!PowerDB.hasData()) return emptyState('생산량 기준이 되는 실적 데이터가 없습니다. 운영에서는 SAP/엑셀 연동 후 호기별 실적 생산량이 표시됩니다.');
+  if (!PowerDB.hasData()) return emptyState('생산량 기준이 되는 실적 데이터가 없습니다. 운영에서는 SAP/엑셀 연동 후 호기별 실적 생산량·가동시간이 표시됩니다.');
 
   var monthOpts = PowerDB.months.map(function (m) {
     var sel = (m === prodplanCurrentMonth()) ? ' selected' : '';
@@ -720,13 +776,13 @@ PAGES.prodplan = function () {
   }).join('');
 
   var cur = prodplanCurrentMonth();
-  var setCnt = PowerDB.lines.filter(function (ln) { return ProdPlan.isSet(cur, ln); }).length;
+  var setCnt = PowerDB.lines.filter(function (ln) { return ProdPlan.isAnySet(cur, ln); }).length;
 
-  // 상단 안내 + 업로드 카드
-  var head = '<div class="card"><div class="card__head"><h3><i class="fas fa-industry" style="color:var(--blue);margin-right:7px"></i>예상 생산량 기준정보</h3>'
+  var head = '<div class="card"><div class="card__head"><h3><i class="fas fa-industry" style="color:var(--blue);margin-right:7px"></i>예상 생산량 기준정보 (이동계획)</h3>'
     + '<div class="grow"></div>' + tag('전 시뮬레이션 공통', 'INBOUND') + '</div><div class="card__body">'
-    + '<div class="note" style="margin-bottom:14px"><i class="fas fa-circle-info"></i> 여기서 입력한 <b>예상 생산량</b>이 전력비 등 모든 원가 시뮬레이션의 공통 기준이 됩니다. '
-    + '값을 비워두면 해당 호기는 <b>실적 생산량</b>을 그대로 사용합니다.</div>'
+    + '<div class="note" style="margin-bottom:14px"><i class="fas fa-circle-info"></i> 호기별 <b>예상 생산량</b>과 <b>가동시간</b>을 입력하면 전력비 등 모든 원가 시뮬레이션의 공통 기준이 됩니다. '
+    + '<b>생산성(생산량/일)</b>은 자동 계산되며, 비워둔 항목은 <b>실적값</b>을 그대로 사용합니다.<br>'
+    + '전력사용량은 <b>가동시간 비례(A방식)</b>로 예측됩니다: 시간당 전력(실적) × 예상 가동시간.</div>'
     + '<div class="grid" style="grid-template-columns:1fr 1fr;gap:12px">'
     + '<div class="field"><label style="display:block;font-size:12px;color:var(--muted);margin-bottom:5px">대상 월</label>'
     + '<select id="pp_month" style="width:100%;padding:9px 11px;border:1px solid var(--border-2);border-radius:8px;font-family:inherit">' + monthOpts + '</select></div>'
@@ -740,86 +796,162 @@ PAGES.prodplan = function () {
 
   var summary = '<div class="grid g-3" id="ppKpis" style="margin-top:16px"></div>';
 
-  var tbl = '<div class="card" style="margin-top:16px"><div class="card__head"><h3>호기별 예상 생산량 입력 <span style="font-size:12px;color:var(--muted)">(' + cur.replace('-', '.') + ')</span></h3>'
+  var tbl = '<div class="card" style="margin-top:16px"><div class="card__head"><h3>호기별 예상 생산량·가동시간 입력 <span style="font-size:12px;color:var(--muted)">(' + cur.replace('-', '.') + ')</span></h3>'
     + '<div class="grow"></div>'
-    + '<span id="pp_setbadge">' + (setCnt > 0 ? tag('예상값 ' + setCnt + '개 적용', 'TRANSFER') : tag('전부 실적값', 'SHIPMENT')) + '</span>'
+    + '<span id="pp_setbadge">' + (setCnt > 0 ? tag('예상값 ' + setCnt + '개 호기', 'TRANSFER') : tag('전부 실적값', 'SHIPMENT')) + '</span>'
     + '<button class="btn" id="pp_resetmonth" style="margin-left:9px"><i class="fas fa-rotate-left"></i> 이 달 전체 실적값으로</button>'
     + '</div>'
     + '<div class="tbl-wrap" style="border:none;border-radius:0"><table class="tbl"><thead><tr>'
-    + '<th>호기</th><th>구분</th><th class="num">실적 생산량</th><th class="num">예상 생산량 (입력)</th><th class="num">증감</th>'
-    + '</tr></thead><tbody id="ppTbody"></tbody></table></div></div>';
+    + '<th>호기</th><th>항목</th><th class="num">단위</th><th class="num">실적</th><th class="num">예상 (입력)</th><th class="num">증감</th>'
+    + '</tr></thead><tbody id="ppTbody"></tbody></table></div>'
+    + '<div class="note" style="margin:10px 14px 4px"><i class="fas fa-calculator"></i> 생산성(생산량/일) = 생산량 ÷ (가동시간 ÷ 24) · 자동 계산</div></div>';
 
   return head + summary + tbl;
 };
 
+// 가동 여부(실적 생산량 또는 사용량이 있는 호기만 표시)
+function ppActiveLine(month, ln) {
+  var rec = (PowerDB.byMonth || {})[month];
+  if (!rec || !rec.lines || !rec.lines[ln]) return false;
+  var l = rec.lines[ln];
+  return (l.prod > 0) || (l.usage > 0) || (l.hours != null && l.hours > 0);
+}
+
 function prodplanRenderTable() {
   var cur = prodplanCurrentMonth();
-  $('#ppTbody').innerHTML = PowerDB.lines.map(function (ln) {
-    var actual = ProdPlan.actual(cur, ln);
-    var rec = (PowerDB.byMonth || {})[cur];
-    var baseUsage = (rec && rec.lines && rec.lines[ln]) ? rec.lines[ln].usage : 0;
-    if (actual === 0 && baseUsage === 0) return ''; // 미가동 호기 숨김
-    var type = PowerDB.lineType[ln];
-    var unitTxt = (type === 'paper') ? 'kg' : 'EA';
-    var isSet = ProdPlan.isSet(cur, ln);
-    var planVal = isSet ? ProdPlan.plan[cur][ln] : '';
-    var deltaPct = (isSet && actual > 0) ? ((planVal - actual) / actual * 100) : 0;
-    var deltaCell = isSet
-      ? '<span class="tag ' + (deltaPct >= 0 ? 'tag-up' : 'tag-down') + '">' + (deltaPct >= 0 ? '+' : '') + deltaPct.toFixed(1) + '%</span>'
-      : '<span style="color:var(--muted-2);font-size:11px">실적 사용</span>';
-    return '<tr><td><b>' + ln + '</b></td>'
-      + '<td><span class="cell-code">' + (type === 'paper' ? 'PAPER' : 'PROC') + '</span></td>'
-      + '<td class="num">' + pfmt.int(actual) + ' <span style="color:var(--muted-2);font-size:10px">' + unitTxt + '</span></td>'
-      + '<td class="num"><input type="number" class="pp_prod" data-line="' + ln + '" value="' + planVal + '" placeholder="' + pfmt.int(actual) + '" '
-      + 'style="width:130px;padding:6px 9px;border:1px solid var(--border-2);border-radius:7px;font-family:inherit;text-align:right;font-size:12.5px"></td>'
-      + '<td>' + deltaCell + '</td></tr>';
-  }).join('');
+  var html = '';
+  var lastGroup = null;
 
-  // KPI 요약
-  var setCnt = PowerDB.lines.filter(function (ln) { return ProdPlan.isSet(cur, ln); }).length;
-  var paperActual = 0, paperPlan = 0;
   PowerDB.lines.forEach(function (ln) {
-    if (PowerDB.lineType[ln] === 'paper') { paperActual += ProdPlan.actual(cur, ln); paperPlan += ProdPlan.get(cur, ln); }
-  });
-  var paperDelta = paperActual > 0 ? ((paperPlan - paperActual) / paperActual * 100) : 0;
-  $('#ppKpis').innerHTML =
-    kpiCard('예상값 입력 호기', setCnt + ' / ' + PowerDB.lines.length, '개', 'fa-pen', 'ico-blue', 'delta-flat', 'fa-industry', cur.replace('-', '.') + ' 기준')
-    + kpiCard('제지·화장지 예상 생산량', pfmt.int(paperPlan / 1000), '톤', 'fa-weight-hanging', 'ico-indigo', (paperDelta >= 0 ? 'delta-up' : 'delta-down'), (paperDelta >= 0 ? 'fa-arrow-up' : 'fa-arrow-down'), (paperDelta >= 0 ? '+' : '') + paperDelta.toFixed(1) + '% vs 실적')
-    + kpiCard('실적 대비 변동', (paperDelta >= 0 ? '+' : '') + paperDelta.toFixed(1), '%', 'fa-chart-line', 'ico-amber', 'delta-flat', 'fa-bolt', 'paper 군 가중');
+    if (!ppActiveLine(cur, ln)) return;
+    var group = (PowerDB.group && PowerDB.group[ln]) || '';
+    var unit = ppDispUnit(ln);
 
-  // 배지 갱신
+    // 그룹 헤더(첫 호기 진입 시)
+    if (group !== lastGroup) {
+      html += '<tr class="row-group"><td colspan="6" style="background:var(--bg-2,#f1f5f9);font-weight:700;color:var(--blue-700,#1d4ed8);font-size:12px;padding:7px 12px">' + group + '</td></tr>';
+      lastGroup = group;
+    }
+
+    // 실적/예상 값 (표시단위)
+    var actProdDisp = ppToDisp(ln, ProdPlan.actual(cur, ln, 'prod'));
+    var actHours = ProdPlan.actual(cur, ln, 'hours');
+    var planProdSet = ProdPlan.isSet(cur, ln, 'prod');
+    var planHoursSet = ProdPlan.isSet(cur, ln, 'hours');
+    var planProdDisp = planProdSet ? ppToDisp(ln, ProdPlan.rec(cur, ln).prod) : '';
+    var planHoursVal = planHoursSet ? ProdPlan.rec(cur, ln).hours : '';
+
+    // 증감(생산량)
+    var prodDelta = (planProdSet && actProdDisp) ? ((planProdDisp - actProdDisp) / actProdDisp * 100) : null;
+    var prodDeltaCell = (prodDelta != null)
+      ? '<span class="tag ' + (prodDelta >= 0 ? 'tag-up' : 'tag-down') + '">' + (prodDelta >= 0 ? '+' : '') + prodDelta.toFixed(1) + '%</span>'
+      : '<span style="color:var(--muted-2);font-size:11px">실적</span>';
+    // 증감(가동시간)
+    var hoursDelta = (planHoursSet && actHours) ? ((planHoursVal - actHours) / actHours * 100) : null;
+    var hoursDeltaCell = (hoursDelta != null)
+      ? '<span class="tag ' + (hoursDelta >= 0 ? 'tag-up' : 'tag-down') + '">' + (hoursDelta >= 0 ? '+' : '') + hoursDelta.toFixed(1) + '%</span>'
+      : (actHours != null ? '<span style="color:var(--muted-2);font-size:11px">실적</span>' : '<span style="color:var(--muted-2);font-size:11px">-</span>');
+
+    // 생산성(자동)
+    var actProductivity = (function () {
+      var p = ProdPlan.actual(cur, ln, 'prod'), h = ProdPlan.actual(cur, ln, 'hours');
+      if (p == null || h == null || h <= 0) return null;
+      return ppToDisp(ln, p) / (h / 24);
+    })();
+    var planProductivity = (function () {
+      var p = ProdPlan.get(cur, ln, 'prod'), h = ProdPlan.get(cur, ln, 'hours');
+      if (p == null || h == null || h <= 0) return null;
+      return ppToDisp(ln, p) / (h / 24);
+    })();
+
+    var rowspan = ' rowspan="3" style="vertical-align:middle"';
+    // 행1: 생산량
+    html += '<tr data-line="' + ln + '" class="pp-rowtop">'
+      + '<td' + rowspan + '><b>' + ln + '</b> <span class="cell-code">' + (PowerDB.lineType[ln] === 'paper' ? 'PAPER' : 'PROC') + '</span></td>'
+      + '<td>생산량</td>'
+      + '<td class="num"><span style="color:var(--muted-2);font-size:11px">' + unit + '</span></td>'
+      + '<td class="num">' + (actProdDisp != null ? pfmt.int(actProdDisp) : '-') + '</td>'
+      + '<td class="num"><input type="number" class="pp_in" data-line="' + ln + '" data-field="prod" value="' + (planProdDisp === '' ? '' : planProdDisp) + '" placeholder="' + (actProdDisp != null ? pfmt.int(actProdDisp) : '') + '" '
+      + 'style="width:120px;padding:5px 8px;border:1px solid var(--border-2);border-radius:7px;font-family:inherit;text-align:right;font-size:12.5px"></td>'
+      + '<td class="pp-delta-prod">' + prodDeltaCell + '</td></tr>';
+    // 행2: 가동시간
+    html += '<tr data-line="' + ln + '">'
+      + '<td>가동시간</td>'
+      + '<td class="num"><span style="color:var(--muted-2);font-size:11px">Hr</span></td>'
+      + '<td class="num">' + (actHours != null ? pfmt.int(actHours) : '<span style="color:var(--muted-2);font-size:11px">N/A</span>') + '</td>'
+      + '<td class="num"><input type="number" class="pp_in" data-line="' + ln + '" data-field="hours" value="' + (planHoursVal === '' ? '' : planHoursVal) + '" placeholder="' + (actHours != null ? pfmt.int(actHours) : '') + '" '
+      + 'style="width:120px;padding:5px 8px;border:1px solid var(--border-2);border-radius:7px;font-family:inherit;text-align:right;font-size:12.5px"></td>'
+      + '<td class="pp-delta-hours">' + hoursDeltaCell + '</td></tr>';
+    // 행3: 생산성(자동)
+    html += '<tr data-line="' + ln + '" style="background:var(--bg-1,#fafbfc)">'
+      + '<td style="color:var(--muted)">생산성</td>'
+      + '<td class="num"><span style="color:var(--muted-2);font-size:11px">' + unit + '/일</span></td>'
+      + '<td class="num" style="color:var(--muted)">' + (actProductivity != null ? pfmt.dec(actProductivity, 1) : '-') + '</td>'
+      + '<td class="num pp-prdct" style="font-weight:600">' + (planProductivity != null ? pfmt.dec(planProductivity, 1) : '-') + '</td>'
+      + '<td><span style="color:var(--muted-2);font-size:11px">자동</span></td></tr>';
+  });
+
+  $('#ppTbody').innerHTML = html;
+  prodplanRenderKpis();
+}
+
+function prodplanRenderKpis() {
+  var cur = prodplanCurrentMonth();
+  var setCnt = PowerDB.lines.filter(function (ln) { return ProdPlan.isAnySet(cur, ln); }).length;
+  // 제지·화장지(paper) 예상 생산량 합계(톤) + 실적 대비
+  var paperActualTon = 0, paperPlanTon = 0;
+  PowerDB.lines.forEach(function (ln) {
+    if (PowerDB.lineType[ln] === 'paper') {
+      var a = ProdPlan.actual(cur, ln, 'prod'); var p = ProdPlan.get(cur, ln, 'prod');
+      paperActualTon += (a != null ? ppToDisp(ln, a) : 0);
+      paperPlanTon += (p != null ? ppToDisp(ln, p) : 0);
+    }
+  });
+  var paperDelta = paperActualTon > 0 ? ((paperPlanTon - paperActualTon) / paperActualTon * 100) : 0;
+  var kp = $('#ppKpis');
+  if (kp) kp.innerHTML =
+    kpiCard('예상값 입력 호기', setCnt + ' / ' + PowerDB.lines.length, '개', 'fa-pen', 'ico-blue', 'delta-flat', 'fa-industry', cur.replace('-', '.') + ' 기준')
+    + kpiCard('제지·화장지 예상 생산량', pfmt.int(paperPlanTon), '톤', 'fa-weight-hanging', 'ico-indigo', (paperDelta >= 0 ? 'delta-up' : 'delta-down'), (paperDelta >= 0 ? 'fa-arrow-up' : 'fa-arrow-down'), (paperDelta >= 0 ? '+' : '') + paperDelta.toFixed(1) + '% vs 실적')
+    + kpiCard('실적 대비 변동(제지·화장지)', (paperDelta >= 0 ? '+' : '') + paperDelta.toFixed(1), '%', 'fa-chart-line', 'ico-amber', 'delta-flat', 'fa-bolt', '생산량 톤 기준');
   var badge = $('#pp_setbadge');
-  if (badge) badge.innerHTML = (setCnt > 0 ? tag('예상값 ' + setCnt + '개 적용', 'TRANSFER') : tag('전부 실적값', 'SHIPMENT'));
+  if (badge) badge.innerHTML = (setCnt > 0 ? tag('예상값 ' + setCnt + '개 호기', 'TRANSFER') : tag('전부 실적값', 'SHIPMENT'));
 }
 
 function prodplanDownloadTemplate() {
-  // 호기 x 월 행렬 양식 (열: 호기, 2026-01 ... 2026-12) — 실적값을 채워서 제공
-  var header = ['호기'].concat(PowerDB.months);
+  // 시트 구조: 호기 | 항목(생산량/가동시간) | 단위 | 2026-01 ... 2026-12  (실적값 채움)
+  var header = ['호기', '항목', '단위'].concat(PowerDB.months);
   var aoa = [header];
   PowerDB.lines.forEach(function (ln) {
-    var row = [ln];
-    PowerDB.months.forEach(function (m) { row.push(ProdPlan.actual(m, ln)); });
-    aoa.push(row);
+    var unit = ppDispUnit(ln);
+    var prodRow = [ln, '생산량', unit];
+    var hoursRow = [ln, '가동시간', 'Hr'];
+    PowerDB.months.forEach(function (m) {
+      var p = ProdPlan.actual(m, ln, 'prod');
+      var h = ProdPlan.actual(m, ln, 'hours');
+      prodRow.push(p != null ? Math.round(ppToDisp(ln, p)) : '');
+      hoursRow.push(h != null ? h : '');
+    });
+    aoa.push(prodRow);
+    aoa.push(hoursRow);
   });
   if (typeof XLSX === 'undefined') {
-    // CSV fallback
     var csv = aoa.map(function (r) { return r.join(','); }).join('\n');
     var blob = new Blob(['\uFEFF' + csv], { type: 'text/csv;charset=utf-8;' });
     var url = URL.createObjectURL(blob);
-    var a = document.createElement('a'); a.href = url; a.download = '예상생산량_양식.csv'; a.click();
+    var a = document.createElement('a'); a.href = url; a.download = '예상생산량_가동시간_양식.csv'; a.click();
     URL.revokeObjectURL(url);
     return;
   }
   var ws = XLSX.utils.aoa_to_sheet(aoa);
   var wb = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(wb, ws, '예상생산량');
-  XLSX.writeFile(wb, '예상생산량_양식.xlsx');
+  XLSX.utils.book_append_sheet(wb, ws, '이동계획');
+  XLSX.writeFile(wb, '예상생산량_가동시간_양식.xlsx');
 }
 
 function prodplanHandleFile(file) {
   var msg = $('#pp_uploadmsg');
   if (typeof XLSX === 'undefined') {
-    if (msg) msg.innerHTML = '<div class="note" style="border-color:var(--red,#dc2626);color:var(--red,#dc2626)"><i class="fas fa-triangle-exclamation"></i> 엑셀 파서를 불러오지 못했습니다. 네트워크 확인 후 다시 시도하세요.</div>';
+    if (msg) msg.innerHTML = '<div class="note" style="border-color:#dc2626;color:#dc2626"><i class="fas fa-triangle-exclamation"></i> 엑셀 파서를 불러오지 못했습니다. 네트워크 확인 후 다시 시도하세요.</div>';
     return;
   }
   var reader = new FileReader();
@@ -830,32 +962,40 @@ function prodplanHandleFile(file) {
       var ws = wb.Sheets[wb.SheetNames[0]];
       var aoa = XLSX.utils.sheet_to_json(ws, { header: 1, blankrows: false });
       if (!aoa.length) throw new Error('빈 시트');
-      // 헤더 행: 첫 셀이 '호기'(또는 line), 이후 셀이 월(YYYY-MM)
       var header = aoa[0].map(function (c) { return ('' + c).trim(); });
-      // 월 컬럼 인덱스 매핑
+      // 컬럼 위치 파악: 호기(0), 항목, 그리고 월 컬럼들
+      var idxLine = 0, idxItem = -1;
       var monthCols = {}; // colIndex -> 'YYYY-MM'
       header.forEach(function (h, i) {
-        if (i === 0) return;
+        var hl = h.replace(/\s/g, '');
+        if (i === 0) { idxLine = 0; return; }
+        if (hl === '항목' || hl === 'item') { idxItem = i; return; }
+        if (hl === '단위' || hl === 'unit') return;
         var norm = normMonth(h);
         if (norm) monthCols[i] = norm;
       });
+      // 항목 컬럼이 없으면: 단순 호기×월(생산량) 양식으로 간주
       var rows = [];
       for (var r = 1; r < aoa.length; r++) {
-        var line = ('' + (aoa[r][0] || '')).trim();
+        var line = ('' + (aoa[r][idxLine] || '')).trim();
         if (!line) continue;
+        var item = (idxItem >= 0) ? ('' + (aoa[r][idxItem] || '')).trim().replace(/\s/g, '') : '생산량';
+        var field = (item === '가동시간' || item.toLowerCase() === 'hours' || item === 'Hr') ? 'hours' : 'prod';
         Object.keys(monthCols).forEach(function (ci) {
           var v = aoa[r][ci];
           if (v === '' || v == null) return;
           var num = +('' + v).replace(/,/g, '');
           if (isNaN(num)) return;
-          rows.push({ month: monthCols[ci], line: line, prod: num });
+          var rec = { month: monthCols[ci], line: line };
+          if (field === 'hours') { rec.hours = num; }
+          else { rec.prod = ppToInternal(line, num); } // 표시단위(톤/천개) → 내부(kg/EA)
+          rows.push(rec);
         });
       }
       var res = ProdPlan.bulkSet(rows);
       if (msg) {
-        var cls = res.applied > 0 ? 'tag-up' : 'tag-gray';
         msg.innerHTML = '<div class="note" style="border-color:var(--blue);color:var(--blue-700)"><i class="fas fa-circle-check"></i> 업로드 완료 — '
-          + '<b>' + res.applied + '건 반영</b>' + (res.skipped > 0 ? ', ' + res.skipped + '건 건너뜀(호기/월 불일치)' : '') + '. 전력비 시뮬레이션에 자동 적용됩니다.</div>';
+          + '<b>' + res.applied + '건 반영</b>' + (res.skipped > 0 ? ', ' + res.skipped + '건 건너뜀(호기/월/값 불일치)' : '') + '. 전력비 시뮬레이션에 자동 적용됩니다.</div>';
       }
       prodplanRenderTable();
     } catch (err) {
@@ -871,8 +1011,7 @@ function normMonth(s) {
   var m = s.match(/(\d{4})\D+(\d{1,2})/);
   if (!m) return null;
   var y = m[1], mo = ('0' + m[2]).slice(-2);
-  var key = y + '-' + mo;
-  return (PowerDB.months.indexOf(key) >= 0) ? key : key; // 검증은 bulkSet에서
+  return y + '-' + mo; // 유효성은 bulkSet에서 검증
 }
 
 AFTER.prodplan = function () {
@@ -884,12 +1023,13 @@ AFTER.prodplan = function () {
     route();
   });
 
-  $('#pp_template') && $('#pp_template').addEventListener('click', prodplanDownloadTemplate);
+  var tplBtn = $('#pp_template');
+  if (tplBtn) tplBtn.addEventListener('click', prodplanDownloadTemplate);
 
   var file = $('#pp_file');
   if (file) file.addEventListener('change', function () {
     if (file.files && file.files[0]) prodplanHandleFile(file.files[0]);
-    file.value = ''; // 같은 파일 재업로드 허용
+    file.value = '';
   });
 
   var rm = $('#pp_resetmonth');
@@ -898,49 +1038,56 @@ AFTER.prodplan = function () {
     route();
   });
 
-  // 입력 이벤트 (위임)
+  // 입력 이벤트(위임): pp_in (data-field: prod|hours)
   var tbody = $('#ppTbody');
   if (tbody) tbody.addEventListener('input', function (e) {
     var inp = e.target;
-    if (!inp.classList || !inp.classList.contains('pp_prod')) return;
+    if (!inp.classList || !inp.classList.contains('pp_in')) return;
     var ln = inp.getAttribute('data-line');
-    ProdPlan.set(prodplanCurrentMonth(), ln, inp.value);
-    // 표 전체 재렌더 대신 KPI/증감만 갱신하면 입력 포커스 유지가 어려움 → 디바운스 없이 KPI만 갱신
-    prodplanUpdateRowDelta(inp, ln);
+    var field = inp.getAttribute('data-field');
+    var cur = prodplanCurrentMonth();
+    // 저장: 생산량은 표시단위→내부단위, 가동시간은 그대로
+    var storeVal = (field === 'prod') ? ppToInternal(ln, inp.value) : (inp.value === '' ? null : +inp.value);
+    ProdPlan.set(cur, ln, field, storeVal);
+    prodplanUpdateRow(ln);
   });
 
   prodplanRenderTable();
 };
 
-// 입력 중 포커스 유지를 위해 해당 행의 증감/KPI만 갱신
-function prodplanUpdateRowDelta(inp, ln) {
+// 입력 중 포커스 유지: 해당 호기의 증감/생산성/KPI만 갱신 (입력 input은 건드리지 않음)
+function prodplanUpdateRow(ln) {
   var cur = prodplanCurrentMonth();
-  var actual = ProdPlan.actual(cur, ln);
-  var isSet = ProdPlan.isSet(cur, ln);
-  var tr = inp.closest('tr');
-  if (tr) {
-    var cell = tr.children[4];
-    if (isSet && actual > 0) {
-      var d = (ProdPlan.plan[cur][ln] - actual) / actual * 100;
-      cell.innerHTML = '<span class="tag ' + (d >= 0 ? 'tag-up' : 'tag-down') + '">' + (d >= 0 ? '+' : '') + d.toFixed(1) + '%</span>';
-    } else {
-      cell.innerHTML = '<span style="color:var(--muted-2);font-size:11px">실적 사용</span>';
-    }
-  }
-  // KPI/배지 갱신
-  var setCnt = PowerDB.lines.filter(function (l) { return ProdPlan.isSet(cur, l); }).length;
-  var paperActual = 0, paperPlan = 0;
-  PowerDB.lines.forEach(function (l) {
-    if (PowerDB.lineType[l] === 'paper') { paperActual += ProdPlan.actual(cur, l); paperPlan += ProdPlan.get(cur, l); }
-  });
-  var paperDelta = paperActual > 0 ? ((paperPlan - paperActual) / paperActual * 100) : 0;
-  var kp = $('#ppKpis');
-  if (kp) kp.innerHTML =
-    kpiCard('예상값 입력 호기', setCnt + ' / ' + PowerDB.lines.length, '개', 'fa-pen', 'ico-blue', 'delta-flat', 'fa-industry', cur.replace('-', '.') + ' 기준')
-    + kpiCard('제지·화장지 예상 생산량', pfmt.int(paperPlan / 1000), '톤', 'fa-weight-hanging', 'ico-indigo', (paperDelta >= 0 ? 'delta-up' : 'delta-down'), (paperDelta >= 0 ? 'fa-arrow-up' : 'fa-arrow-down'), (paperDelta >= 0 ? '+' : '') + paperDelta.toFixed(1) + '% vs 실적')
-    + kpiCard('실적 대비 변동', (paperDelta >= 0 ? '+' : '') + paperDelta.toFixed(1), '%', 'fa-chart-line', 'ico-amber', 'delta-flat', 'fa-bolt', 'paper 군 가중');
-  var badge = $('#pp_setbadge');
-  if (badge) badge.innerHTML = (setCnt > 0 ? tag('예상값 ' + setCnt + '개 적용', 'TRANSFER') : tag('전부 실적값', 'SHIPMENT'));
+  var unit = ppDispUnit(ln);
+  // 해당 호기의 3개 tr 찾기
+  var trs = $all('#ppTbody tr[data-line="' + ln + '"]');
+  if (!trs.length) return;
+
+  var actProdDisp = ppToDisp(ln, ProdPlan.actual(cur, ln, 'prod'));
+  var actHours = ProdPlan.actual(cur, ln, 'hours');
+  var planProdSet = ProdPlan.isSet(cur, ln, 'prod');
+  var planHoursSet = ProdPlan.isSet(cur, ln, 'hours');
+  var planProdDisp = ppToDisp(ln, ProdPlan.get(cur, ln, 'prod'));
+  var planHoursVal = ProdPlan.get(cur, ln, 'hours');
+
+  // 증감 생산량 (행1)
+  var prodDelta = (planProdSet && actProdDisp) ? ((planProdDisp - actProdDisp) / actProdDisp * 100) : null;
+  var c1 = trs[0] && trs[0].querySelector('.pp-delta-prod');
+  if (c1) c1.innerHTML = (prodDelta != null)
+    ? '<span class="tag ' + (prodDelta >= 0 ? 'tag-up' : 'tag-down') + '">' + (prodDelta >= 0 ? '+' : '') + prodDelta.toFixed(1) + '%</span>'
+    : '<span style="color:var(--muted-2);font-size:11px">실적</span>';
+  // 증감 가동시간 (행2)
+  var hoursDelta = (planHoursSet && actHours) ? ((planHoursVal - actHours) / actHours * 100) : null;
+  var c2 = trs[1] && trs[1].querySelector('.pp-delta-hours');
+  if (c2) c2.innerHTML = (hoursDelta != null)
+    ? '<span class="tag ' + (hoursDelta >= 0 ? 'tag-up' : 'tag-down') + '">' + (hoursDelta >= 0 ? '+' : '') + hoursDelta.toFixed(1) + '%</span>'
+    : (actHours != null ? '<span style="color:var(--muted-2);font-size:11px">실적</span>' : '<span style="color:var(--muted-2);font-size:11px">-</span>');
+  // 생산성 (행3)
+  var prdct = (planProdDisp != null && planHoursVal != null && planHoursVal > 0) ? (planProdDisp / (planHoursVal / 24)) : null;
+  var c3 = trs[2] && trs[2].querySelector('.pp-prdct');
+  if (c3) c3.innerHTML = (prdct != null ? pfmt.dec(prdct, 1) : '-');
+
+  prodplanRenderKpis();
 }
 
 /* ====================== AI 분석 어시스턴트 (slide 9) ====================== */
