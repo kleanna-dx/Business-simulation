@@ -537,14 +537,16 @@ PAGES.approval = function () {
    PowerDB는 운영에서 PowerDB.load(payload)로 채움. */
 var PowerDB = (typeof DEMO_MODE !== 'undefined' && DEMO_MODE && typeof POWER_DEMO !== 'undefined')
   ? POWER_DEMO
-  : { lines: [], months: [], lineType: {}, byMonth: {}, unit: {}, group: {} };
+  : { lines: [], months: [], lineType: {}, byMonth: {}, unit: {}, group: {}, essGuarantee: {}, essEff: 0.9 };
 PowerDB.hasData = function () { return this.months && this.months.length > 0; };
 PowerDB.load = function (payload) {
   if (!payload) return this;
   var self = this;
-  ['lines', 'months', 'lineType', 'byMonth', 'unit', 'group'].forEach(function (k) { if (payload[k] != null) self[k] = payload[k]; });
+  ['lines', 'months', 'lineType', 'byMonth', 'unit', 'group', 'essGuarantee', 'essEff'].forEach(function (k) { if (payload[k] != null) self[k] = payload[k]; });
   return this;
 };
+// computeMonth에 전달할 ESS 옵션
+PowerDB.essOpt = function () { return { essGuarantee: this.essGuarantee || {}, essEff: (this.essEff != null) ? this.essEff : 0.9 }; };
 
 /* ====================== 예상 생산량 기준정보 (전역 공유) ======================
    ProdPlan.plan[month][line] = { prod?, hours? }  (예상 생산량 / 예상 가동시간)
@@ -612,6 +614,44 @@ var ProdPlan = {
   },
   clearMonth: function (month) {
     delete this.plan[month];
+    this.saveStorage();
+  },
+  // ── 일자(평일/토요일/휴일) 입력 ──  month별 단일 레코드: plan[month].__days = {weekday,sat,holiday}
+  // 실적 일자 (PowerDB.byMonth[m].days). field: 'weekday'|'sat'|'holiday'
+  actualDay: function (month, field) {
+    var rec = (PowerDB.byMonth || {})[month];
+    if (rec && rec.days && rec.days[field] != null) return +rec.days[field];
+    return null;
+  },
+  // 일자 입력 레코드 ({weekday?,sat?,holiday?} 또는 null)
+  daysRec: function (month) {
+    return (this.plan[month] && this.plan[month].__days) ? this.plan[month].__days : null;
+  },
+  isDaySet: function (month, field) {
+    var r = this.daysRec(month);
+    return !!(r && r[field] != null);
+  },
+  // 예상 일자: 입력값 우선, 없으면 실적값
+  getDay: function (month, field) {
+    var r = this.daysRec(month);
+    if (r && r[field] != null) return +r[field];
+    return this.actualDay(month, field);
+  },
+  // computeMonth override용 days 객체 (입력값이 하나라도 있을 때만 반환)
+  getDays: function (month) {
+    var r = this.daysRec(month);
+    if (!r) return null;
+    var out = {};
+    ['weekday', 'sat', 'holiday'].forEach(function (k) { if (r[k] != null) out[k] = +r[k]; });
+    return Object.keys(out).length ? out : null;
+  },
+  setDay: function (month, field, val) {
+    if (!this.plan[month]) this.plan[month] = {};
+    if (!this.plan[month].__days) this.plan[month].__days = {};
+    if (val == null || val === '') { delete this.plan[month].__days[field]; }
+    else { this.plan[month].__days[field] = +val; }
+    if (Object.keys(this.plan[month].__days).length === 0) { delete this.plan[month].__days; }
+    if (this.plan[month] && Object.keys(this.plan[month]).length === 0) { delete this.plan[month]; }
     this.saveStorage();
   },
   // 엑셀 업로드 결과 일괄 반영: rows = [{month, line, prod?, hours?}]
@@ -689,15 +729,24 @@ PAGES.power = function () {
   var kpis = '<div class="grid g-3" id="pwKpis"></div>';
   var tbl = '<div class="card"><div class="card__head"><h3>호기별 전력비 상세</h3><div class="grow"></div>'
     + '<span class="legend"><span class="l">' + tag('제지/화장지', 'TRANSFER') + 'kWh/ton</span><span class="l">' + tag('가공/생리대', 'SHIPMENT') + 'kWh/개</span></span></div>'
+    + '<div class="note" style="margin:0 0 6px"><i class="fas fa-circle-info"></i> 전력사용량 = <b>모고객</b>(가동시간 비례 A방식) + <b>ESS</b>(충전식: ESS충전보증량 × (평일+토요일) × 효율 0.9)</div>'
     + '<div class="tbl-wrap" style="border:none;border-radius:0"><table class="tbl"><thead><tr>'
-    + '<th>호기</th><th class="num">가동시간 [Hr]</th><th class="num">전력사용량 [kWh]</th><th class="num">생산량</th><th class="num">전력원단위</th>'
+    + '<th>호기</th><th class="num">가동시간 [Hr]</th><th class="num">모고객 [kWh]</th><th class="num">ESS [kWh]</th><th class="num">사용량 합계 [kWh]</th><th class="num">생산량</th><th class="num">전력원단위</th>'
     + '<th class="num">전력비원단위</th><th class="num">전력비 [원]</th><th>변동</th>'
     + '</tr></thead><tbody id="pwTbody"></tbody></table></div></div>';
+
+  // 전력요금 6항목 + 회계비용 카드
+  var feeCard = '<div class="card"><div class="card__head"><h3><i class="fas fa-file-invoice-dollar" style="color:var(--blue);margin-right:7px"></i>전력요금 구성 (공장 전체)</h3>'
+    + '<div class="grow"></div><span style="font-size:11px;color:var(--muted-2)">단위: 백만원</span></div>'
+    + '<div class="card__body"><div id="pwFee"></div>'
+    + '<div class="note" style="margin-top:10px"><i class="fas fa-calculator"></i> 회계비용 = ①모고객요금 + ②ESS요금 + ③SPC지급금 − ④DR정산금 − ⑤복합보일러차감비 − ⑥삼성보상금'
+    + '<br><span style="color:var(--muted-2)">※ 요금 산식(요금=사용량×단가 등)은 추후 반영 예정 — 현재는 SAP/이동계획 수신값을 표시·집계합니다.</span></div>'
+    + '</div></div>';
 
   return stepper
     + '<div class="grid" style="grid-template-columns:360px 1fr;gap:16px;align-items:start">'
     + controls
-    + '<div class="grid" style="gap:16px">' + kpis + tbl + '</div>'
+    + '<div class="grid" style="gap:16px">' + kpis + tbl + feeCard + '</div>'
     + '</div>';
 };
 
@@ -716,6 +765,9 @@ function powerRender() {
       ov[ln] = o;
     });
     if (PowerState.price != null) ov.price = PowerState.price;
+    // 일자(평일/토요일/휴일) 사용자 입력 반영 (예상월만)
+    var dov = ProdPlan.getDays(cur.key);
+    if (dov) ov.days = dov;
   }
   // 기간 배너 갱신
   var pb = $('#pw_period');
@@ -726,15 +778,15 @@ function powerRender() {
     pb.style.borderColor = isActual ? 'var(--muted-2,#94a3b8)' : 'var(--blue,#2563eb)';
     pb.style.color = isActual ? 'var(--muted,#64748b)' : 'var(--blue-700,#1d4ed8)';
   }
-  var res = PowerCalc.computeMonth(cur.rec, PowerDB.lines, PowerDB.lineType, ov);
+  var res = PowerCalc.computeMonth(cur.rec, PowerDB.lines, PowerDB.lineType, ov, PowerDB.essOpt());
 
-  // KPIs
-  var totalCost = res.totals.cost;
+  // KPIs (회계비용 = 요금 6항목 집계)
+  var acctCost = res.fee.acct;
   var totalUsage = res.totals.usage;
   var perTon = res.totals.paperCostPerTon;
   $('#pwKpis').innerHTML =
-    kpiCard('총 전력비', pfmt.baek(totalCost), '백만원', 'fa-won-sign', 'ico-blue', 'delta-flat', 'fa-bolt', cur.key.replace('-', '.') + ' 기준')
-    + kpiCard('총 전력사용량', pfmt.baek(totalUsage * 1000) , '백만kWh', 'fa-plug', 'ico-indigo', 'delta-flat', 'fa-gauge', '회계 단가 ' + res.price.toFixed(2) + '원')
+    kpiCard('회계비용 (전력)', pfmt.baek(acctCost), '백만원', 'fa-won-sign', 'ico-blue', 'delta-flat', 'fa-bolt', cur.key.replace('-', '.') + ' · 6항목 집계')
+    + kpiCard('총 전력사용량', pfmt.baek(totalUsage) , '백만kWh', 'fa-plug', 'ico-indigo', 'delta-flat', 'fa-gauge', '모고객 ' + pfmt.baek(res.totals.usageMo) + ' + ESS ' + pfmt.baek(res.totals.usageEss))
     + kpiCard('제지·화장지 톤당 전력비', pfmt.won(perTon), '원/톤', 'fa-weight-hanging', 'ico-amber', 'delta-flat', 'fa-industry', 'paper 군 가중');
 
   // table
@@ -758,19 +810,48 @@ function powerRender() {
     var hoursCell = (r.planHours != null)
       ? pfmt.dec(r.planHours, 0)
       : '<span style="color:var(--muted-2);font-size:11px" title="실적 가동시간 없음 → 생산량 기준(B방식)">N/A</span>';
-    var modeBadge = (r.usageMode === 'B') ? ' <span class="cell-code" title="가동시간 실적 없음: 실적 전력사용량 그대로 사용">B</span>' : '';
+    var modeBadge = (r.usageMode === 'B') ? ' <span class="cell-code" title="가동시간 실적 없음: 실적 모고객 사용량 그대로 사용">B</span>' : '';
+    var essBadge = (r.essMode === 'charge') ? ' <span class="cell-code" title="ESS 충전식: 보증량 ' + pfmt.dec(r.essGuarantee, 1) + ' × (평일+토) × 0.9">충전</span>' : '';
     return '<tr><td><b>' + r.line + '</b> <span class="cell-code">' + (isPaper ? 'PAPER' : 'PROC') + '</span></td>'
       + '<td class="num">' + hoursCell + '</td>'
-      + '<td class="num">' + pfmt.int(r.usage) + modeBadge + '</td>'
+      + '<td class="num">' + pfmt.int(r.usageMo) + modeBadge + '</td>'
+      + '<td class="num">' + pfmt.int(r.usageEss) + essBadge + '</td>'
+      + '<td class="num"><b>' + pfmt.int(r.usage) + '</b></td>'
       + '<td class="num">' + pfmt.int(r.prod) + ' <span style="color:var(--muted-2);font-size:10px">' + prodU + '</span></td>'
       + '<td class="num">' + pfmt.dec(r.unit, isPaper ? 2 : 4) + ' <span style="color:var(--muted-2);font-size:10px">' + unitU + '</span></td>'
       + '<td class="num">' + pfmt.dec(r.costUnit, isPaper ? 2 : 4) + ' <span style="color:var(--muted-2);font-size:10px">' + costU + '</span></td>'
       + '<td class="num"><b>' + pfmt.won(r.cost) + '</b></td>'
       + '<td>' + deltaCell + '</td></tr>';
   }).join('')
-    + '<tr class="row-total"><td>합계</td><td class="num">-</td><td class="num">' + pfmt.int(res.totals.usage) + '</td>'
+    + '<tr class="row-total"><td>합계</td><td class="num">-</td>'
+    + '<td class="num">' + pfmt.int(res.totals.usageMo) + '</td>'
+    + '<td class="num">' + pfmt.int(res.totals.usageEss) + '</td>'
+    + '<td class="num"><b>' + pfmt.int(res.totals.usage) + '</b></td>'
     + '<td class="num">-</td><td class="num">-</td><td class="num">-</td>'
     + '<td class="num">' + pfmt.won(res.totals.cost) + '</td><td>-</td></tr>';
+
+  // 전력요금 6항목 + 회계비용
+  var feeEl = $('#pwFee');
+  if (feeEl) {
+    var f = res.fee;
+    var items = [
+      { no: '①', key: 'mo', label: '모고객요금', val: f.mo, sign: '+' },
+      { no: '②', key: 'ess', label: 'ESS요금', val: f.ess, sign: '+' },
+      { no: '③', key: 'spc', label: 'SPC지급금', val: f.spc, sign: '+' },
+      { no: '④', key: 'dr', label: 'DR정산금', val: f.dr, sign: '−' },
+      { no: '⑤', key: 'boiler', label: '복합보일러차감비', val: f.boiler, sign: '−' },
+      { no: '⑥', key: 'samsung', label: '삼성보상금(기타)', val: f.samsung, sign: '−' }
+    ];
+    feeEl.innerHTML = '<table class="tbl" style="margin:0"><thead><tr><th>항목</th><th class="num">부호</th><th class="num">금액 [백만원]</th></tr></thead><tbody>'
+      + items.map(function (it) {
+        var minus = (it.sign === '−');
+        return '<tr><td>' + it.no + ' ' + it.label + '</td>'
+          + '<td class="num" style="color:' + (minus ? 'var(--rose,#e11d48)' : 'var(--blue-700,#1d4ed8)') + ';font-weight:600">' + it.sign + '</td>'
+          + '<td class="num">' + pfmt.baek(it.val) + '</td></tr>';
+      }).join('')
+      + '<tr class="row-total"><td><b>회계비용 합계</b></td><td class="num">=</td><td class="num"><b>' + pfmt.baek(f.acct) + '</b></td></tr>'
+      + '</tbody></table>';
+  }
 }
 
 AFTER.power = function () {
@@ -847,6 +928,31 @@ PAGES.prodplan = function () {
     + '<div id="pp_uploadmsg" style="margin-top:10px"></div>'
     + '</div></div>';
 
+  // 일자(평일/토요일/휴일) 입력 카드 — ESS 충전식 계산에 사용
+  var dWeek = ProdPlan.getDay(cur, 'weekday');
+  var dSat = ProdPlan.getDay(cur, 'sat');
+  var dHol = ProdPlan.getDay(cur, 'holiday');
+  var daySet = ProdPlan.isDaySet(cur, 'weekday') || ProdPlan.isDaySet(cur, 'sat') || ProdPlan.isDaySet(cur, 'holiday');
+  var dayDisabled = curIsActual ? ' disabled title="실적 확정월 — 수정 금지"' : '';
+  var dayInputStyle = 'width:100%;padding:8px 10px;border:1px solid var(--border-2);border-radius:8px;font-family:inherit;text-align:right' + (curIsActual ? ';background:#f1f5f9;color:#94a3b8;cursor:not-allowed' : '');
+  function dayField(id, lab, val) {
+    return '<div class="field"><label style="display:block;font-size:12px;color:var(--muted);margin-bottom:5px">' + lab + '</label>'
+      + '<input id="' + id + '" type="number" min="0" step="1" value="' + (val == null ? '' : val) + '"' + dayDisabled + ' style="' + dayInputStyle + '"></div>';
+  }
+  var dayCard = '<div class="card" style="margin-top:16px"><div class="card__head"><h3><i class="fas fa-calendar-days" style="color:var(--blue);margin-right:7px"></i>일자 입력 (ESS 충전 기준)</h3>'
+    + '<div class="grow"></div>' + (curIsActual ? tag('실적 확정', 'INBOUND') : (daySet ? tag('입력값 적용', 'TRANSFER') : tag('실적값 사용', 'SHIPMENT'))) + '</div><div class="card__body">'
+    + '<div class="note" style="margin-bottom:12px"><i class="fas fa-circle-info"></i> ESS 충전 사용량 = <b>ESS충전보증량 × (평일 + 토요일) × 효율(0.9)</b>. '
+    + '토요일은 <b>휴일(대체)</b>로 처리되며, 충전 가동일 = 평일 + 토요일입니다.</div>'
+    + '<div class="grid" style="grid-template-columns:1fr 1fr 1fr 1.2fr;gap:12px;align-items:end">'
+    + dayField('pp_dweek', '평일 [일]', dWeek)
+    + dayField('pp_dsat', '토요일 [일]', dSat)
+    + dayField('pp_dhol', '휴일 [일]', dHol)
+    + '<div class="field"><label style="display:block;font-size:12px;color:var(--muted);margin-bottom:5px">충전 가동일 / 총일수</label>'
+    + '<div id="pp_daysum" style="padding:9px 11px;border:1px dashed var(--border-2);border-radius:8px;text-align:right;font-weight:600;color:var(--blue-700,#1d4ed8)"></div></div>'
+    + '</div>'
+    + (curIsActual ? '' : '<button class="btn" id="pp_resetdays" style="margin-top:10px"><i class="fas fa-rotate-left"></i> 일자 실적값으로 초기화</button>')
+    + '</div></div>';
+
   var summary = '<div class="grid g-3" id="ppKpis" style="margin-top:16px"></div>';
 
   var tbl = '<div class="card" style="margin-top:16px"><div class="card__head"><h3>호기별 예상 생산량·가동시간 입력 <span style="font-size:12px;color:var(--muted)">(' + cur.replace('-', '.') + ')</span></h3>'
@@ -859,8 +965,19 @@ PAGES.prodplan = function () {
     + '</tr></thead><tbody id="ppTbody"></tbody></table></div>'
     + '<div class="note" style="margin:10px 14px 4px"><i class="fas fa-calculator"></i> 생산성(생산량/일) = 생산량 ÷ (가동시간 ÷ 24) · 자동 계산</div></div>';
 
-  return head + summary + tbl;
+  return head + dayCard + summary + tbl;
 };
+
+// 일자 합계 표시 갱신
+function prodplanRenderDaySum() {
+  var el = $('#pp_daysum');
+  if (!el) return;
+  var cur = prodplanCurrentMonth();
+  var w = ProdPlan.getDay(cur, 'weekday') || 0;
+  var s = ProdPlan.getDay(cur, 'sat') || 0;
+  var h = ProdPlan.getDay(cur, 'holiday') || 0;
+  el.innerHTML = (w + s) + '일 <span style="color:var(--muted-2);font-size:11px;font-weight:400">/ 총 ' + (w + s + h) + '일</span>';
+}
 
 // 가동 여부(실적 생산량 또는 사용량이 있는 호기만 표시)
 function ppActiveLine(month, ln) {
@@ -1094,6 +1211,30 @@ AFTER.prodplan = function () {
     ProdPlan.clearMonth(prodplanCurrentMonth());
     route();
   });
+
+  // 일자(평일/토요일/휴일) 입력
+  function bindDay(id, field) {
+    var el = $('#' + id);
+    if (!el) return;
+    el.addEventListener('input', function () {
+      var cur = prodplanCurrentMonth();
+      if (Period.isActual(cur)) return; // 실적월 — 수정 금지
+      ProdPlan.setDay(cur, field, el.value === '' ? null : +el.value);
+      prodplanRenderDaySum();
+    });
+  }
+  bindDay('pp_dweek', 'weekday');
+  bindDay('pp_dsat', 'sat');
+  bindDay('pp_dhol', 'holiday');
+  var rd = $('#pp_resetdays');
+  if (rd) rd.addEventListener('click', function () {
+    var cur = prodplanCurrentMonth();
+    ProdPlan.setDay(cur, 'weekday', null);
+    ProdPlan.setDay(cur, 'sat', null);
+    ProdPlan.setDay(cur, 'holiday', null);
+    route();
+  });
+  prodplanRenderDaySum();
 
   // 입력 이벤트(위임): pp_in (data-field: prod|hours)
   var tbody = $('#ppTbody');
