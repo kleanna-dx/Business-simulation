@@ -676,7 +676,133 @@ var ProdPlan = {
 };
 ProdPlan.loadStorage();
 
+/* ============================================================
+   예상 생산량 기준정보 — 변경 이력 (Change History)
+   - 월별로 "변경 저장" 시 스냅샷 1건 기록: 변경ID / 일시 / 변경자 / 사유 / 변경 항목(before→after)
+   - 현재는 localStorage(precost_prodplan_hist_v1). 추후 MariaDB로 이관.
+
+   [MariaDB 매핑 — 추후 연동]
+   CREATE TABLE prod_plan_history (
+     change_id   VARCHAR(20) PRIMARY KEY,   -- 'CHG-20260601-001' (this.entry.id)
+     period      DATE NOT NULL,             -- 대상월 (entry.month 'YYYY-MM' → 1일)
+     changed_by  VARCHAR(64) NOT NULL,      -- 변경자 (entry.by)
+     reason      VARCHAR(255),              -- 변경 사유 (entry.reason)
+     changed_at  DATETIME NOT NULL,         -- 변경 일시 (entry.at, ISO)
+     item_count  INT NOT NULL DEFAULT 0,    -- 변경 항목 수
+     INDEX (period, changed_at)
+   );
+   CREATE TABLE prod_plan_history_item (    -- entry.items[] 1:N
+     change_id  VARCHAR(20) NOT NULL,
+     line_name  VARCHAR(32) NOT NULL,       -- 호기
+     field      ENUM('prod','hours') NOT NULL,
+     before_val DECIMAL(20,4) NULL,         -- 변경 전(내부단위)
+     after_val  DECIMAL(20,4) NULL,         -- 변경 후(내부단위)
+     FOREIGN KEY (change_id) REFERENCES prod_plan_history(change_id)
+   );
+   ============================================================ */
+var ProdPlanHistory = {
+  STORAGE_KEY: 'precost_prodplan_hist_v1',
+  log: {},          // { 'YYYY-MM': [ entry, ... ] }  (최신이 앞)
+  seq: {},          // { 'YYYYMMDD': lastSeqInt }  변경ID 일련번호
+  loadStorage: function () {
+    try {
+      var raw = localStorage.getItem(this.STORAGE_KEY);
+      if (raw) {
+        var o = JSON.parse(raw) || {};
+        this.log = o.log || {};
+        this.seq = o.seq || {};
+      }
+    } catch (e) { this.log = {}; this.seq = {}; }
+  },
+  saveStorage: function () {
+    try { localStorage.setItem(this.STORAGE_KEY, JSON.stringify({ log: this.log, seq: this.seq })); } catch (e) {}
+  },
+  // 변경 ID 생성: CHG-YYYYMMDD-NNN
+  nextId: function (d) {
+    d = d || new Date();
+    var ymd = '' + d.getFullYear() + ('0' + (d.getMonth() + 1)).slice(-2) + ('0' + d.getDate()).slice(-2);
+    var n = (this.seq[ymd] || 0) + 1;
+    this.seq[ymd] = n;
+    return 'CHG-' + ymd + '-' + ('00' + n).slice(-3);
+  },
+  list: function (month) { return this.log[month] || []; },
+  count: function (month) { return (this.log[month] || []).length; },
+  // 이력 1건 기록. items = [{line, field, before, after}] (내부단위 값)
+  // meta = { by, reason }
+  record: function (month, items, meta) {
+    meta = meta || {};
+    var now = new Date();
+    var entry = {
+      id: this.nextId(now),
+      month: month,
+      by: (meta.by || '').trim() || '(미입력)',
+      reason: (meta.reason || '').trim(),
+      at: now.toISOString(),
+      items: (items || []).map(function (it) {
+        return { line: it.line, field: it.field, before: (it.before == null ? null : +it.before), after: (it.after == null ? null : +it.after) };
+      })
+    };
+    if (!this.log[month]) this.log[month] = [];
+    this.log[month].unshift(entry); // 최신이 앞
+    this.saveStorage();
+    return entry;
+  }
+};
+ProdPlanHistory.loadStorage();
+
 var ProdPlanState = { month: null };
+
+// 변경 저장 직후 비교 기준(baseline) 스냅샷: { 'YYYY-MM': { 호기: {prod,hours} } }
+// 마지막 저장 이후 무엇이 바뀌었는지(=다음 이력 항목)를 계산하는 데 사용.
+var ProdPlanBaseline = {
+  STORAGE_KEY: 'precost_prodplan_base_v1',
+  snap: {},
+  loadStorage: function () {
+    try { var raw = localStorage.getItem(this.STORAGE_KEY); if (raw) this.snap = JSON.parse(raw) || {}; } catch (e) { this.snap = {}; }
+  },
+  saveStorage: function () { try { localStorage.setItem(this.STORAGE_KEY, JSON.stringify(this.snap)); } catch (e) {} },
+  // 현재 ProdPlan 입력값(내부단위)으로 월 스냅샷 갱신
+  capture: function (month) {
+    var m = {};
+    PowerDB.lines.forEach(function (ln) {
+      var r = ProdPlan.rec(month, ln);
+      if (r && (r.prod != null || r.hours != null)) {
+        var o = {};
+        if (r.prod != null) o.prod = r.prod;
+        if (r.hours != null) o.hours = r.hours;
+        m[ln] = o;
+      }
+    });
+    this.snap[month] = m;
+    this.saveStorage();
+  },
+  get: function (month, line, field) {
+    var s = this.snap[month];
+    if (s && s[line] && s[line][field] != null) return s[line][field];
+    return null;
+  }
+};
+ProdPlanBaseline.loadStorage();
+
+// 마지막 저장(baseline) 이후 변경된 항목 목록 계산 → record()에 넘길 items
+// 비교 기준: baseline에 스냅샷이 있으면 그 값, 없으면 SAP 실적값(ProdPlan.actual)
+function prodplanPendingChanges(month) {
+  var items = [];
+  PowerDB.lines.forEach(function (ln) {
+    ['prod', 'hours'].forEach(function (field) {
+      var after = ProdPlan.get(month, ln, field); // 현재 적용값(입력 or 실적fallback)
+      var hasBase = (ProdPlanBaseline.get(month, ln, field) != null);
+      var before = hasBase ? ProdPlanBaseline.get(month, ln, field) : ProdPlan.actual(month, ln, field);
+      var a = (after == null) ? null : +after;
+      var b = (before == null) ? null : +before;
+      // 의미있는 차이만 (둘 다 null이면 skip)
+      if (a == null && b == null) return;
+      var diff = (a == null || b == null) ? true : (Math.abs(a - b) > 0.5);
+      if (diff) items.push({ line: ln, field: field, before: b, after: a });
+    });
+  });
+  return items;
+}
 
 var PowerState = { month: null, price: null };
 
@@ -1084,15 +1210,169 @@ PAGES.prodplan = function () {
   var tbl = '<div class="card" style="margin-top:16px"><div class="card__head"><h3>호기별 예상 생산량·가동시간 입력 <span style="font-size:12px;color:var(--muted)">(' + cur.replace('-', '.') + ')</span></h3>'
     + '<div class="grow"></div>'
     + '<span id="pp_setbadge">' + (curIsActual ? tag('실적 확정', 'INBOUND') : (setCnt > 0 ? tag('예상값 ' + setCnt + '개 호기', 'TRANSFER') : tag('미입력', 'SHIPMENT'))) + '</span>'
+    + (curIsActual ? '' : '<button class="btn btn-primary" id="pp_save" style="margin-left:9px"><i class="fas fa-floppy-disk"></i> 변경 저장 (이력 남기기)</button>')
     + (curIsActual ? '' : '<button class="btn" id="pp_resetmonth" style="margin-left:9px"><i class="fas fa-rotate-left"></i> 이 달 입력 전체 초기화</button>')
     + '</div>'
     + '<div class="tbl-wrap" style="border:none;border-radius:0"><table class="tbl"><thead><tr>'
     + '<th>호기</th><th>항목</th><th class="num">단위</th><th class="num">실적</th><th class="num">예상 (입력)</th><th class="num">증감</th>'
     + '</tr></thead><tbody id="ppTbody"></tbody></table></div>'
-    + '<div class="note" style="margin:10px 14px 4px"><i class="fas fa-calculator"></i> 생산성(생산량/일) = 생산량 ÷ (가동시간 ÷ 24) · 자동 계산</div></div>';
+    + '<div class="note" style="margin:10px 14px 4px"><i class="fas fa-calculator"></i> 생산성(생산량/일) = 생산량 ÷ (가동시간 ÷ 24) · 자동 계산'
+    + (curIsActual ? '' : '<br><i class="fas fa-circle-info"></i> 입력값은 즉시 시뮬레이션에 반영됩니다. <b>“변경 저장”</b>을 누르면 <b>변경자·사유와 함께 변경 이력</b>이 기록됩니다.') + '</div></div>';
 
-  return head + dayCard + summary + tbl;
+  // 변경 이력 카드 (월별)
+  var histCard = prodplanHistoryCard(cur);
+
+  return head + dayCard + summary + tbl + histCard;
 };
+
+// 월별 변경 이력 카드 HTML
+function prodplanHistoryCard(month) {
+  var list = ProdPlanHistory.list(month);
+  var rows;
+  if (!list.length) {
+    rows = '<div class="note" style="margin:0"><i class="fas fa-clock-rotate-left"></i> 아직 저장된 변경 이력이 없습니다. 예상값을 입력하고 <b>“변경 저장”</b>을 누르면 이력이 기록됩니다.</div>';
+  } else {
+    rows = '<div class="tbl-wrap" style="border:none;border-radius:0"><table class="tbl"><thead><tr>'
+      + '<th>변경 ID</th><th>변경 일시</th><th>변경자</th><th>변경 사유</th><th class="num">변경 항목</th><th></th>'
+      + '</tr></thead><tbody>'
+      + list.map(function (e, i) {
+          var d = new Date(e.at);
+          var dt = d.getFullYear() + '.' + ('0' + (d.getMonth() + 1)).slice(-2) + '.' + ('0' + d.getDate()).slice(-2)
+            + ' ' + ('0' + d.getHours()).slice(-2) + ':' + ('0' + d.getMinutes()).slice(-2);
+          return '<tr>'
+            + '<td><span class="cell-code">' + esc(e.id) + '</span></td>'
+            + '<td>' + dt + '</td>'
+            + '<td>' + esc(e.by) + '</td>'
+            + '<td style="max-width:280px;white-space:normal">' + (e.reason ? esc(e.reason) : '<span style="color:var(--muted-2)">(사유 미입력)</span>') + '</td>'
+            + '<td class="num">' + e.items.length + '건</td>'
+            + '<td><button class="btn" style="padding:4px 9px;font-size:12px" onclick="prodplanShowHistDetail(\'' + esc(e.month) + '\',' + i + ')"><i class="fas fa-list"></i> 상세</button></td>'
+            + '</tr>';
+        }).join('')
+      + '</tbody></table></div>';
+  }
+  return '<div class="card" style="margin-top:16px"><div class="card__head"><h3><i class="fas fa-clock-rotate-left" style="color:var(--blue);margin-right:7px"></i>예상 생산량 변경 이력 <span style="font-size:12px;color:var(--muted)">(' + month.replace('-', '.') + ')</span></h3>'
+    + '<div class="grow"></div>' + tag(list.length + '건', 'INBOUND') + '</div>'
+    + '<div class="card__body" id="pp_histbody">' + rows + '</div></div>';
+}
+
+// ── 모달 헬퍼 ──
+function ppCloseModal() {
+  var ov = $('#pp_modal_ov');
+  if (ov && ov.parentNode) ov.parentNode.removeChild(ov);
+}
+function ppOpenModal(html) {
+  ppCloseModal();
+  var ov = document.createElement('div');
+  ov.id = 'pp_modal_ov';
+  ov.className = 'pp-modal-ov';
+  ov.innerHTML = '<div class="pp-modal">' + html + '</div>';
+  ov.addEventListener('click', function (e) { if (e.target === ov) ppCloseModal(); });
+  document.body.appendChild(ov);
+  var onKey = function (e) { if (e.key === 'Escape') { ppCloseModal(); document.removeEventListener('keydown', onKey); } };
+  document.addEventListener('keydown', onKey);
+  return ov;
+}
+
+// 항목 라벨/값 포맷 (이력 표시용)
+function ppHistFieldLabel(field) { return field === 'prod' ? '생산량' : '가동시간'; }
+function ppHistVal(line, field, val) {
+  if (val == null) return '<span style="color:var(--muted-2)">-</span>';
+  if (field === 'prod') return pfmt.int(ppToDisp(line, val)) + ' <span style="color:var(--muted-2);font-size:10px">' + ppDispUnit(line) + '</span>';
+  return pfmt.int(val) + ' <span style="color:var(--muted-2);font-size:10px">Hr</span>';
+}
+
+// "변경 저장" 클릭 → 변경 항목 계산 → 변경자/사유 모달
+function prodplanOpenSaveModal() {
+  var cur = prodplanCurrentMonth();
+  if (Period.isActual(cur)) return; // 실적월은 저장 불가
+  var items = prodplanPendingChanges(cur);
+  if (!items.length) {
+    ppOpenModal(
+      '<div class="pp-modal__head"><i class="fas fa-circle-info"></i> 저장할 변경 없음<button class="x" onclick="ppCloseModal()">&times;</button></div>'
+      + '<div class="pp-modal__body"><div class="note" style="margin:0"><i class="fas fa-circle-info"></i> 마지막 저장 이후 변경된 값이 없습니다. 예상 생산량·가동시간을 수정한 뒤 다시 시도하세요.</div></div>'
+      + '<div class="pp-modal__foot"><button class="btn" onclick="ppCloseModal()">닫기</button></div>'
+    );
+    return;
+  }
+  var rows = items.map(function (it) {
+    var cls = '';
+    if (it.before != null && it.after != null) cls = (it.after >= it.before) ? 'pp-chg-up' : 'pp-chg-down';
+    return '<tr><td><b>' + esc(it.line) + '</b></td><td>' + ppHistFieldLabel(it.field) + '</td>'
+      + '<td class="num">' + ppHistVal(it.line, it.field, it.before) + '</td>'
+      + '<td class="num"><i class="fas fa-arrow-right" style="color:var(--muted-2);font-size:10px"></i></td>'
+      + '<td class="num ' + cls + '">' + ppHistVal(it.line, it.field, it.after) + '</td></tr>';
+  }).join('');
+  ppOpenModal(
+    '<div class="pp-modal__head"><i class="fas fa-floppy-disk"></i> 변경 저장 — ' + cur.replace('-', '.') + ' <button class="x" onclick="ppCloseModal()">&times;</button></div>'
+    + '<div class="pp-modal__body">'
+    + '<div style="margin-bottom:14px"><label>변경자 (ID/성명) <span style="color:#dc2626">*</span></label>'
+    + '<input id="pp_chg_by" type="text" placeholder="예: 홍길동 / hong" autocomplete="off"></div>'
+    + '<div style="margin-bottom:14px"><label>변경 사유</label>'
+    + '<textarea id="pp_chg_reason" placeholder="예: 7월 정기보수 반영, 제지3 증산 계획 등"></textarea></div>'
+    + '<div style="font-size:12px;color:var(--muted);margin-bottom:6px">변경 항목 <b>' + items.length + '건</b> (마지막 저장 이후)</div>'
+    + '<div class="tbl-wrap" style="border:1px solid var(--border);border-radius:8px"><table class="tbl"><thead><tr>'
+    + '<th>호기</th><th>항목</th><th class="num">변경 전</th><th></th><th class="num">변경 후</th></tr></thead><tbody>'
+    + rows + '</tbody></table></div>'
+    + '<div id="pp_chg_err" style="color:#dc2626;font-size:12px;margin-top:8px;display:none"><i class="fas fa-triangle-exclamation"></i> 변경자를 입력하세요.</div>'
+    + '</div>'
+    + '<div class="pp-modal__foot"><button class="btn" onclick="ppCloseModal()">취소</button>'
+    + '<button class="btn btn-primary" onclick="prodplanConfirmSave()"><i class="fas fa-check"></i> 저장</button></div>'
+  );
+  setTimeout(function () { var b = $('#pp_chg_by'); if (b) b.focus(); }, 50);
+}
+
+// 모달 "저장" 확정
+function prodplanConfirmSave() {
+  var cur = prodplanCurrentMonth();
+  var by = $('#pp_chg_by');
+  var reason = $('#pp_chg_reason');
+  if (!by || !by.value.trim()) {
+    var err = $('#pp_chg_err'); if (err) err.style.display = 'block';
+    if (by) by.focus();
+    return;
+  }
+  var items = prodplanPendingChanges(cur);
+  if (!items.length) { ppCloseModal(); return; }
+  ProdPlanHistory.record(cur, items, { by: by.value, reason: reason ? reason.value : '' });
+  ProdPlanBaseline.capture(cur); // 저장 시점을 새 비교 기준으로
+  ppCloseModal();
+  route(); // 이력 카드 갱신
+}
+
+// 이력 상세 모달
+function prodplanShowHistDetail(month, idx) {
+  var list = ProdPlanHistory.list(month);
+  var e = list[idx];
+  if (!e) return;
+  var d = new Date(e.at);
+  var dt = d.getFullYear() + '.' + ('0' + (d.getMonth() + 1)).slice(-2) + '.' + ('0' + d.getDate()).slice(-2)
+    + ' ' + ('0' + d.getHours()).slice(-2) + ':' + ('0' + d.getMinutes()).slice(-2) + ':' + ('0' + d.getSeconds()).slice(-2);
+  var rows = e.items.map(function (it) {
+    var cls = '';
+    if (it.before != null && it.after != null) cls = (it.after >= it.before) ? 'pp-chg-up' : 'pp-chg-down';
+    return '<tr><td><b>' + esc(it.line) + '</b></td><td>' + ppHistFieldLabel(it.field) + '</td>'
+      + '<td class="num">' + ppHistVal(it.line, it.field, it.before) + '</td>'
+      + '<td class="num"><i class="fas fa-arrow-right" style="color:var(--muted-2);font-size:10px"></i></td>'
+      + '<td class="num ' + cls + '">' + ppHistVal(it.line, it.field, it.after) + '</td></tr>';
+  }).join('');
+  ppOpenModal(
+    '<div class="pp-modal__head"><i class="fas fa-list"></i> 변경 상세 — ' + esc(e.id) + '<button class="x" onclick="ppCloseModal()">&times;</button></div>'
+    + '<div class="pp-modal__body">'
+    + '<div class="grid" style="grid-template-columns:1fr 1fr;gap:8px;margin-bottom:14px;font-size:13px">'
+    + '<div><span style="color:var(--muted)">대상월</span><br><b>' + e.month.replace('-', '.') + '</b></div>'
+    + '<div><span style="color:var(--muted)">변경 일시</span><br><b>' + dt + '</b></div>'
+    + '<div><span style="color:var(--muted)">변경자</span><br><b>' + esc(e.by) + '</b></div>'
+    + '<div><span style="color:var(--muted)">변경 항목</span><br><b>' + e.items.length + '건</b></div>'
+    + '</div>'
+    + '<div style="margin-bottom:14px"><span style="color:var(--muted);font-size:13px">변경 사유</span><br>'
+    + (e.reason ? esc(e.reason) : '<span style="color:var(--muted-2)">(사유 미입력)</span>') + '</div>'
+    + '<div class="tbl-wrap" style="border:1px solid var(--border);border-radius:8px"><table class="tbl"><thead><tr>'
+    + '<th>호기</th><th>항목</th><th class="num">변경 전</th><th></th><th class="num">변경 후</th></tr></thead><tbody>'
+    + rows + '</tbody></table></div>'
+    + '</div>'
+    + '<div class="pp-modal__foot"><button class="btn" onclick="ppCloseModal()">닫기</button></div>'
+  );
+}
 
 // 일자 합계 표시 갱신
 function prodplanRenderDaySum() {
@@ -1352,6 +1632,9 @@ AFTER.prodplan = function () {
     if (file.files && file.files[0]) prodplanHandleFile(file.files[0]);
     file.value = '';
   });
+
+  var sv = $('#pp_save');
+  if (sv) sv.addEventListener('click', prodplanOpenSaveModal);
 
   var rm = $('#pp_resetmonth');
   if (rm) rm.addEventListener('click', function () {

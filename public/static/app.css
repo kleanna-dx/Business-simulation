@@ -175,6 +175,20 @@ table.tbl tr:hover td.pw-input{background:var(--blue-100)}
   padding:2px 5px;border-radius:5px;background:var(--blue-100);color:var(--blue-700);vertical-align:middle}
 .cell-plan i{font-size:9px}
 
+/* ---------- Modal ---------- */
+.pp-modal-ov{position:fixed;inset:0;background:rgba(15,23,42,.45);display:flex;align-items:center;justify-content:center;z-index:1000;padding:20px}
+.pp-modal{background:#fff;border-radius:14px;box-shadow:0 20px 60px rgba(15,23,42,.3);width:100%;max-width:520px;max-height:85vh;overflow:auto}
+.pp-modal__head{display:flex;align-items:center;gap:8px;padding:16px 20px;border-bottom:1px solid var(--border);font-weight:700;font-size:15px}
+.pp-modal__head i{color:var(--blue)}
+.pp-modal__head .x{margin-left:auto;cursor:pointer;color:var(--muted-2);font-size:18px;background:none;border:none;line-height:1}
+.pp-modal__body{padding:18px 20px}
+.pp-modal__foot{display:flex;gap:10px;padding:14px 20px;border-top:1px solid var(--border);justify-content:flex-end}
+.pp-modal label{display:block;font-size:12px;color:var(--muted);margin-bottom:5px;font-weight:600}
+.pp-modal input,.pp-modal textarea{width:100%;padding:9px 11px;border:1px solid var(--border-2);border-radius:8px;font-family:inherit;font-size:13px}
+.pp-modal textarea{resize:vertical;min-height:64px}
+.pp-chg-up{color:#dc2626;font-weight:600}
+.pp-chg-down{color:#2563eb;font-weight:600}
+
 /* ---------- Tabs ---------- */
 .tabs{display:flex;gap:4px;border-bottom:1px solid var(--border);margin-bottom:18px}
 .tab{padding:9px 15px;font-size:13px;font-weight:600;color:var(--muted);cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px}
