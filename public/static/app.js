@@ -1148,7 +1148,11 @@ function prodplanHasActual(month) {
 function ppDispUnit(ln) { return (PowerDB.unit && PowerDB.unit[ln]) || ((PowerDB.lineType[ln] === 'paper') ? '톤' : 'EA'); }
 function ppFactor(ln) { var u = ppDispUnit(ln); return (u === '톤' || u === '천개') ? 1000 : 1; } // 내부 = 표시 × factor
 function ppToDisp(ln, internal) { if (internal == null) return null; return internal / ppFactor(ln); }
-function ppToInternal(ln, disp) { if (disp == null || disp === '') return null; return (+disp) * ppFactor(ln); }
+function ppToInternal(ln, disp) { if (disp == null || disp === '') return null; return ppNum(disp) * ppFactor(ln); }
+// 쉼표 포함 문자열 → 숫자 (입력칸이 text라 쉼표가 섞일 수 있음)
+function ppNum(v) { if (v == null || v === '') return NaN; return +('' + v).replace(/,/g, ''); }
+// 숫자 → 3자리 쉼표 문자열 (입력칸 value 표시용). 빈값/NaN이면 ''
+function ppComma(v) { if (v == null || v === '' || isNaN(+('' + v).replace(/,/g, ''))) return ''; return (+('' + v).replace(/,/g, '')).toLocaleString('en-US'); }
 // 그룹 순서·소계용
 var PP_GROUP_ORDER = ['제지', '화장지', '가공', '생리대', '라미네이팅'];
 
@@ -1453,7 +1457,7 @@ function prodplanRenderTable() {
       + '<td>생산량</td>'
       + '<td class="num"><span style="color:var(--muted-2);font-size:11px">' + unit + '</span></td>'
       + '<td class="num">' + (actProdDisp != null ? pfmt.int(actProdDisp) : '-') + '</td>'
-      + '<td class="num"><input type="number" class="pp_in" data-line="' + ln + '" data-field="prod" value="' + (planProdDisp === '' ? '' : planProdDisp) + '" placeholder="' + (actProdDisp != null ? pfmt.int(actProdDisp) : '') + '"' + lockAttr + ' '
+      + '<td class="num"><input type="text" inputmode="numeric" class="pp_in" data-line="' + ln + '" data-field="prod" value="' + (planProdDisp === '' ? '' : ppComma(planProdDisp)) + '" placeholder="' + (actProdDisp != null ? pfmt.int(actProdDisp) : '') + '"' + lockAttr + ' '
       + 'style="width:120px;padding:5px 8px;border:1px solid var(--border-2);border-radius:7px;font-family:inherit;text-align:right;font-size:12.5px' + lockStyle + '"></td>'
       + '<td class="pp-delta-prod">' + prodDeltaCell + '</td></tr>';
     // 행2: 가동시간
@@ -1461,7 +1465,7 @@ function prodplanRenderTable() {
       + '<td>가동시간</td>'
       + '<td class="num"><span style="color:var(--muted-2);font-size:11px">Hr</span></td>'
       + '<td class="num">' + (actHours != null ? pfmt.int(actHours) : '<span style="color:var(--muted-2);font-size:11px">' + (hasActual ? 'N/A' : '-') + '</span>') + '</td>'
-      + '<td class="num"><input type="number" class="pp_in" data-line="' + ln + '" data-field="hours" value="' + (planHoursVal === '' ? '' : planHoursVal) + '" placeholder="' + (actHours != null ? pfmt.int(actHours) : '') + '"' + lockAttr + ' '
+      + '<td class="num"><input type="text" inputmode="numeric" class="pp_in" data-line="' + ln + '" data-field="hours" value="' + (planHoursVal === '' ? '' : ppComma(planHoursVal)) + '" placeholder="' + (actHours != null ? pfmt.int(actHours) : '') + '"' + lockAttr + ' '
       + 'style="width:120px;padding:5px 8px;border:1px solid var(--border-2);border-radius:7px;font-family:inherit;text-align:right;font-size:12.5px' + lockStyle + '"></td>'
       + '<td class="pp-delta-hours">' + hoursDeltaCell + '</td></tr>';
     // 행3: 생산성(자동) — 생산성 = 생산량 ÷ (가동시간 ÷ 24)
@@ -1667,19 +1671,32 @@ AFTER.prodplan = function () {
   prodplanRenderDaySum();
 
   // 입력 이벤트(위임): pp_in (data-field: prod|hours)
+  // 입력 중에는 쉼표 제거값으로 저장만(커서 튐 방지), 포커스 아웃(blur) 시 3자리 쉼표로 재표시
   var tbody = $('#ppTbody');
-  if (tbody) tbody.addEventListener('input', function (e) {
-    var inp = e.target;
-    if (!inp.classList || !inp.classList.contains('pp_in')) return;
-    var ln = inp.getAttribute('data-line');
-    var field = inp.getAttribute('data-field');
-    var cur = prodplanCurrentMonth();
-    if (Period.isActual(cur)) return; // 실적 확정월 — 입력 무시(수정 금지)
-    // 저장: 생산량은 표시단위→내부단위, 가동시간은 그대로
-    var storeVal = (field === 'prod') ? ppToInternal(ln, inp.value) : (inp.value === '' ? null : +inp.value);
-    ProdPlan.set(cur, ln, field, storeVal);
-    prodplanUpdateRow(ln);
-  });
+  if (tbody) {
+    tbody.addEventListener('input', function (e) {
+      var inp = e.target;
+      if (!inp.classList || !inp.classList.contains('pp_in')) return;
+      var ln = inp.getAttribute('data-line');
+      var field = inp.getAttribute('data-field');
+      var cur = prodplanCurrentMonth();
+      if (Period.isActual(cur)) return; // 실적 확정월 — 입력 무시(수정 금지)
+      // 숫자/쉼표/소수점 외 문자는 즉시 정리
+      var cleaned = inp.value.replace(/[^\d.,]/g, '');
+      if (cleaned !== inp.value) inp.value = cleaned;
+      var n = ppNum(inp.value);
+      // 저장: 생산량은 표시단위→내부단위, 가동시간은 그대로
+      var storeVal = (inp.value === '' || isNaN(n)) ? null : (field === 'prod' ? n * ppFactor(ln) : n);
+      ProdPlan.set(cur, ln, field, storeVal);
+      prodplanUpdateRow(ln);
+    });
+    // 포커스 아웃 시 3자리 쉼표로 정돈
+    tbody.addEventListener('focusout', function (e) {
+      var inp = e.target;
+      if (!inp.classList || !inp.classList.contains('pp_in')) return;
+      if (inp.value !== '') inp.value = ppComma(inp.value);
+    });
+  }
 
   prodplanRenderTable();
 };
