@@ -128,8 +128,9 @@ function route() {
 }
 
 /* ---------- shared helpers ---------- */
-function kpiCard(label, val, unit, ico, icoCls, deltaCls, deltaIco, deltaTxt) {
-  return '<div class="kpi"><div class="kpi__top"><span class="kpi__label">' + label + '</span>'
+function kpiCard(label, val, unit, ico, icoCls, deltaCls, deltaIco, deltaTxt, tip) {
+  var tipAttr = tip ? ' title="' + esc(tip) + '" style="cursor:help"' : '';
+  return '<div class="kpi"' + tipAttr + '><div class="kpi__top"><span class="kpi__label">' + label + '</span>'
     + '<span class="kpi__ico ' + icoCls + '"><i class="fas ' + ico + '"></i></span></div>'
     + '<div class="kpi__val">' + val + (unit ? '<span class="unit">' + unit + '</span>' : '') + '</div>'
     + (deltaTxt ? '<div class="kpi__delta ' + deltaCls + '"><i class="fas ' + deltaIco + '"></i>' + deltaTxt + '</div>' : '')
@@ -685,6 +686,15 @@ function defaultMonth() {
   return (PowerDB.months || [])[0];
 }
 
+/* title 속성용 이스케이프 (계산 산식 툴팁). 줄바꿈(\n)은 브라우저가 title에서 줄로 표시. */
+function esc(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
 /* ── 대상 연/월 분리 선택 UI ──
    PowerDB.months("YYYY-MM")에서 연도/월 목록을 추출해 드롭다운 2개(연/월)를 생성.
    prefix: 'pw' | 'pp' → 요소 id = {prefix}_year / {prefix}_month
@@ -833,10 +843,19 @@ function powerRender() {
   var acctCost = res.fee.acct;
   var totalUsage = res.totals.usage;
   var perTon = res.totals.paperCostPerTon;
+  var f0 = res.fee;
+  var acctTip = '회계비용 = ①모고객요금 ' + pfmt.baek(f0.mo) + ' + ②ESS요금 ' + pfmt.baek(f0.ess)
+    + ' + ③SPC ' + pfmt.baek(f0.spc) + ' − ④DR ' + pfmt.baek(f0.dr)
+    + ' − ⑤복합보일러 ' + pfmt.baek(f0.boiler) + ' − ⑥삼성보상금 ' + pfmt.baek(f0.samsung)
+    + '\n= ' + pfmt.baek(acctCost) + ' 백만원';
+  var totalUsageTip = '총 전력사용량 = 모고객 ' + pfmt.baek(res.totals.usageMo) + ' + ESS ' + pfmt.baek(res.totals.usageEss)
+    + '\n= ' + pfmt.baek(totalUsage) + ' 백만kWh';
+  var perTonTip = '톤당 전력비 = 제지·화장지 전력비합 ' + pfmt.won(res.totals.paperCost) + '원 ÷ (생산량합 ' + pfmt.int(res.totals.paperProdKg) + 'kg ÷ 1000)'
+    + '\n= ' + pfmt.won(perTon) + ' 원/톤';
   $('#pwKpis').innerHTML =
-    kpiCard('회계비용 (전력)', pfmt.baek(acctCost), '백만원', 'fa-won-sign', 'ico-blue', 'delta-flat', 'fa-bolt', cur.key.replace('-', '.') + ' · 6항목 집계')
-    + kpiCard('총 전력사용량', pfmt.baek(totalUsage) , '백만kWh', 'fa-plug', 'ico-indigo', 'delta-flat', 'fa-gauge', '모고객 ' + pfmt.baek(res.totals.usageMo) + ' + ESS ' + pfmt.baek(res.totals.usageEss))
-    + kpiCard('제지·화장지 톤당 전력비', pfmt.won(perTon), '원/톤', 'fa-weight-hanging', 'ico-amber', 'delta-flat', 'fa-industry', 'paper 군 가중');
+    kpiCard('회계비용 (전력)', pfmt.baek(acctCost), '백만원', 'fa-won-sign', 'ico-blue', 'delta-flat', 'fa-bolt', cur.key.replace('-', '.') + ' · 6항목 집계', acctTip)
+    + kpiCard('총 전력사용량', pfmt.baek(totalUsage) , '백만kWh', 'fa-plug', 'ico-indigo', 'delta-flat', 'fa-gauge', '모고객 ' + pfmt.baek(res.totals.usageMo) + ' + ESS ' + pfmt.baek(res.totals.usageEss), totalUsageTip)
+    + kpiCard('제지·화장지 톤당 전력비', pfmt.won(perTon), '원/톤', 'fa-weight-hanging', 'ico-amber', 'delta-flat', 'fa-industry', 'paper 군 가중', perTonTip);
 
   // table
   $('#pwTbody').innerHTML = res.rows.map(function (r) {
@@ -862,28 +881,52 @@ function powerRender() {
     var modeBadge = (r.usageMode === 'B') ? ' <span class="cell-code" title="가동시간 실적 없음: 실적 모고객 사용량 그대로 사용">B</span>'
       : (r.usageMode === 'lami') ? ' <span class="cell-code" title="라미네이팅 고정값: 제지2·제지3 모두 가동=23,000 / 하나만=15,000 / 미가동=0">고정</span>'
       : '';
-    // 모고객 구성 tooltip: A방식 + 공통설비배분 + 라미고정
-    var moTip = '모고객 구성  ·  A방식(호기) ' + pfmt.int(r.moBase)
-      + ' + 공통설비배분 ' + pfmt.int(r.moCommon)
-      + (r.moLami ? ' + 라미고정 ' + pfmt.int(r.moLami) : '') + ' kWh';
     var essBadge = (r.essMode === 'charge') ? ' <span class="cell-code" title="ESS 충전식: 보증량 ' + pfmt.dec(r.essGuarantee, 1) + ' × (평일+토) × 0.9">충전</span>' : '';
+
+    // ── 셀별 계산 산식 툴팁 (실제 값 대입) ──
+    var hoursTip = (r.planHours != null)
+      ? (r.usageMode === 'A'
+          ? '예상 가동시간 = ' + pfmt.dec(r.planHours, 1) + ' Hr (입력값, 미입력 시 실적 ' + pfmt.dec(r.baseHours, 1) + ')'
+          : '가동시간 = ' + pfmt.dec(r.planHours, 1) + ' Hr')
+      : '실적 가동시간 없음 → 생산량 기준(B방식)';
+    var moParts = [];
+    if (r.usageMode === 'A') moParts.push('A방식(호기) = 시간당전력 ' + pfmt.dec(r.baseHours > 0 ? r.baseUsageMo / r.baseHours : 0, 2) + ' × 예상가동 ' + pfmt.dec(r.planHours, 1) + ' = ' + pfmt.int(r.moBase));
+    else if (r.usageMode === 'lami') moParts.push('A방식 미적용(라미 호기)');
+    else if (r.usageMode === 'B') moParts.push('B방식(실적 모고객) = ' + pfmt.int(r.moBase));
+    else moParts.push('직접입력 = ' + pfmt.int(r.moBase));
+    moParts.push('공통설비배분 = ' + pfmt.int(r.moCommon) + (r.moCommon ? ' (생산량비율 배분)' : ' (공통설비 0)'));
+    if (r.moLami) moParts.push('라미고정 = ' + pfmt.int(r.moLami));
+    var moTip = '모고객 = ' + moParts.join('  +  ') + '\n= ' + pfmt.int(r.usageMo) + ' kWh';
+    var essTip = (r.essMode === 'charge')
+      ? 'ESS(충전식) = 충전보증량 ' + pfmt.dec(r.essGuarantee, 1) + ' × (평일+토 ' + pfmt.int(r.essGuarantee > 0 ? r.usageEss / (r.essGuarantee * 0.9) : 0) + '일) × 효율 0.9\n= ' + pfmt.int(r.usageEss) + ' kWh'
+      : 'ESS = 실적값 ' + pfmt.int(r.usageEss) + ' kWh (충전보증량/일자 미설정)';
+    var usageTip = '사용량 합계 = 모고객 ' + pfmt.int(r.usageMo) + ' + ESS ' + pfmt.int(r.usageEss) + '\n= ' + pfmt.int(r.usage) + ' kWh';
+    var prodTip = '생산량 = ' + pfmt.int(r.prod) + ' ' + prodU + (Math.abs(r.prod - r.baseProd) > 0.5 ? ' (이동계획 입력, 실적 ' + pfmt.int(r.baseProd) + ')' : ' (실적)');
+    var unitTip = isPaper
+      ? '전력원단위 = 사용량 ÷ 생산량 × 1000\n= ' + pfmt.int(r.usage) + ' ÷ ' + pfmt.int(r.prod) + ' × 1000 = ' + pfmt.dec(r.unit, 2) + ' kWh/ton'
+      : '전력원단위 = 사용량 ÷ 생산량\n= ' + pfmt.int(r.usage) + ' ÷ ' + pfmt.int(r.prod) + ' = ' + pfmt.dec(r.unit, 4) + ' kWh/개';
+    var costUnitTip = isPaper
+      ? '전력비원단위 = 전력원단위 × 단가 ÷ 1000\n= ' + pfmt.dec(r.unit, 2) + ' × ' + pfmt.dec(r.price, 2) + ' ÷ 1000 = ' + pfmt.dec(r.costUnit, 2) + ' 천원/ton'
+      : '전력비원단위 = 전력원단위 × 단가\n= ' + pfmt.dec(r.unit, 4) + ' × ' + pfmt.dec(r.price, 2) + ' = ' + pfmt.dec(r.costUnit, 4) + ' 원/개';
+    var costTip = '전력비 = 사용량 × 단가\n= ' + pfmt.int(r.usage) + ' × ' + pfmt.dec(r.price, 2) + ' = ' + pfmt.won(r.cost) + ' 원';
+
     return '<tr><td><b>' + r.line + '</b> <span class="cell-code">' + (isPaper ? 'PAPER' : 'PROC') + '</span></td>'
-      + '<td class="num">' + hoursCell + '</td>'
-      + '<td class="num" title="' + moTip + '">' + pfmt.int(r.usageMo) + modeBadge + '</td>'
-      + '<td class="num">' + pfmt.int(r.usageEss) + essBadge + '</td>'
-      + '<td class="num"><b>' + pfmt.int(r.usage) + '</b></td>'
-      + '<td class="num">' + pfmt.int(r.prod) + ' <span style="color:var(--muted-2);font-size:10px">' + prodU + '</span></td>'
-      + '<td class="num">' + pfmt.dec(r.unit, isPaper ? 2 : 4) + ' <span style="color:var(--muted-2);font-size:10px">' + unitU + '</span></td>'
-      + '<td class="num">' + pfmt.dec(r.costUnit, isPaper ? 2 : 4) + ' <span style="color:var(--muted-2);font-size:10px">' + costU + '</span></td>'
-      + '<td class="num"><b>' + pfmt.won(r.cost) + '</b></td>'
+      + '<td class="num" title="' + esc(hoursTip) + '">' + hoursCell + '</td>'
+      + '<td class="num" title="' + esc(moTip) + '">' + pfmt.int(r.usageMo) + modeBadge + '</td>'
+      + '<td class="num" title="' + esc(essTip) + '">' + pfmt.int(r.usageEss) + essBadge + '</td>'
+      + '<td class="num" title="' + esc(usageTip) + '"><b>' + pfmt.int(r.usage) + '</b></td>'
+      + '<td class="num" title="' + esc(prodTip) + '">' + pfmt.int(r.prod) + ' <span style="color:var(--muted-2);font-size:10px">' + prodU + '</span></td>'
+      + '<td class="num" title="' + esc(unitTip) + '">' + pfmt.dec(r.unit, isPaper ? 2 : 4) + ' <span style="color:var(--muted-2);font-size:10px">' + unitU + '</span></td>'
+      + '<td class="num" title="' + esc(costUnitTip) + '">' + pfmt.dec(r.costUnit, isPaper ? 2 : 4) + ' <span style="color:var(--muted-2);font-size:10px">' + costU + '</span></td>'
+      + '<td class="num" title="' + esc(costTip) + '"><b>' + pfmt.won(r.cost) + '</b></td>'
       + '<td>' + deltaCell + '</td></tr>';
   }).join('')
     + '<tr class="row-total"><td>합계</td><td class="num">-</td>'
-    + '<td class="num" title="A방식 ' + pfmt.int(res.totals.moBase) + ' + 공통설비배분 ' + pfmt.int(res.totals.moCommon) + ' + 라미고정 ' + pfmt.int(res.totals.moLami) + '">' + pfmt.int(res.totals.usageMo) + '</td>'
-    + '<td class="num">' + pfmt.int(res.totals.usageEss) + '</td>'
-    + '<td class="num"><b>' + pfmt.int(res.totals.usage) + '</b></td>'
+    + '<td class="num" title="' + esc('모고객 합계 = A방식 ' + pfmt.int(res.totals.moBase) + ' + 공통설비배분 ' + pfmt.int(res.totals.moCommon) + ' + 라미고정 ' + pfmt.int(res.totals.moLami) + '\n= ' + pfmt.int(res.totals.usageMo) + ' kWh') + '">' + pfmt.int(res.totals.usageMo) + '</td>'
+    + '<td class="num" title="' + esc('ESS 합계 = ' + pfmt.int(res.totals.usageEss) + ' kWh (호기별 충전식 합)') + '">' + pfmt.int(res.totals.usageEss) + '</td>'
+    + '<td class="num" title="' + esc('총 사용량 = 모고객 ' + pfmt.int(res.totals.usageMo) + ' + ESS ' + pfmt.int(res.totals.usageEss) + '\n= ' + pfmt.int(res.totals.usage) + ' kWh') + '"><b>' + pfmt.int(res.totals.usage) + '</b></td>'
     + '<td class="num">-</td><td class="num">-</td><td class="num">-</td>'
-    + '<td class="num">' + pfmt.won(res.totals.cost) + '</td><td>-</td></tr>';
+    + '<td class="num" title="' + esc('전력비 합계 = Σ(호기별 사용량 × 단가)\n= ' + pfmt.won(res.totals.cost) + ' 원') + '">' + pfmt.won(res.totals.cost) + '</td><td>-</td></tr>';
 
   // 전력요금 6항목 + 회계비용
   var feeEl = $('#pwFee');
@@ -897,14 +940,23 @@ function powerRender() {
       { no: '⑤', key: 'boiler', label: '복합보일러차감비', val: f.boiler, sign: '−' },
       { no: '⑥', key: 'samsung', label: '삼성보상금(기타)', val: f.samsung, sign: '−' }
     ];
+    var feeTip = {
+      mo: '①모고객요금: 가산(+). SAP/이동계획 수신값', ess: '②ESS요금: 가산(+). SAP/이동계획 수신값',
+      spc: '③SPC지급금: 가산(+). SAP/이동계획 수신값', dr: '④DR정산금: 차감(−). SAP/이동계획 수신값',
+      boiler: '⑤복합보일러차감비: 차감(−). SAP/이동계획 수신값', samsung: '⑥삼성보상금(기타): 차감(−). SAP/이동계획 수신값'
+    };
+    var acctFormula = '회계비용 = ①모고객 ' + pfmt.baek(f.mo) + ' + ②ESS ' + pfmt.baek(f.ess)
+      + ' + ③SPC ' + pfmt.baek(f.spc) + ' − ④DR ' + pfmt.baek(f.dr)
+      + ' − ⑤복합보일러 ' + pfmt.baek(f.boiler) + ' − ⑥삼성보상금 ' + pfmt.baek(f.samsung)
+      + '\n= ' + pfmt.baek(f.acct) + ' 백만원';
     feeEl.innerHTML = '<table class="tbl" style="margin:0"><thead><tr><th>항목</th><th class="num">부호</th><th class="num">금액 [백만원]</th></tr></thead><tbody>'
       + items.map(function (it) {
         var minus = (it.sign === '−');
-        return '<tr><td>' + it.no + ' ' + it.label + '</td>'
+        return '<tr title="' + esc(feeTip[it.key] + ' = ' + pfmt.baek(it.val) + ' 백만원') + '"><td>' + it.no + ' ' + it.label + '</td>'
           + '<td class="num" style="color:' + (minus ? 'var(--rose,#e11d48)' : 'var(--blue-700,#1d4ed8)') + ';font-weight:600">' + it.sign + '</td>'
           + '<td class="num">' + pfmt.baek(it.val) + '</td></tr>';
       }).join('')
-      + '<tr class="row-total"><td><b>회계비용 합계</b></td><td class="num">=</td><td class="num"><b>' + pfmt.baek(f.acct) + '</b></td></tr>'
+      + '<tr class="row-total" title="' + esc(acctFormula) + '"><td><b>회계비용 합계</b></td><td class="num">=</td><td class="num"><b>' + pfmt.baek(f.acct) + '</b></td></tr>'
       + '</tbody></table>';
   }
 }
@@ -1112,12 +1164,20 @@ function prodplanRenderTable() {
       + '<td class="num"><input type="number" class="pp_in" data-line="' + ln + '" data-field="hours" value="' + (planHoursVal === '' ? '' : planHoursVal) + '" placeholder="' + (actHours != null ? pfmt.int(actHours) : '') + '"' + lockAttr + ' '
       + 'style="width:120px;padding:5px 8px;border:1px solid var(--border-2);border-radius:7px;font-family:inherit;text-align:right;font-size:12.5px' + lockStyle + '"></td>'
       + '<td class="pp-delta-hours">' + hoursDeltaCell + '</td></tr>';
-    // 행3: 생산성(자동)
+    // 행3: 생산성(자동) — 생산성 = 생산량 ÷ (가동시간 ÷ 24)
+    var actPH = ProdPlan.actual(cur, ln, 'hours');
+    var planPH = ProdPlan.get(cur, ln, 'hours');
+    var actPrTip = (actProductivity != null)
+      ? '실적 생산성 = 생산량 ' + pfmt.int(actProdDisp) + ' ÷ (가동시간 ' + pfmt.int(actPH) + ' ÷ 24)\n= ' + pfmt.dec(actProductivity, 1) + ' ' + unit + '/일'
+      : '실적 생산량·가동시간이 없어 계산 불가';
+    var planPrTip = (planProductivity != null)
+      ? '예상 생산성 = 생산량 ' + pfmt.int(ppToDisp(ln, ProdPlan.get(cur, ln, 'prod'))) + ' ÷ (가동시간 ' + pfmt.int(planPH) + ' ÷ 24)\n= ' + pfmt.dec(planProductivity, 1) + ' ' + unit + '/일'
+      : '예상 생산량·가동시간 입력 시 자동 계산';
     html += '<tr data-line="' + ln + '" style="background:var(--bg-1,#fafbfc)">'
       + '<td style="color:var(--muted)">생산성</td>'
       + '<td class="num"><span style="color:var(--muted-2);font-size:11px">' + unit + '/일</span></td>'
-      + '<td class="num" style="color:var(--muted)">' + (actProductivity != null ? pfmt.dec(actProductivity, 1) : '-') + '</td>'
-      + '<td class="num pp-prdct" style="font-weight:600">' + (planProductivity != null ? pfmt.dec(planProductivity, 1) : '-') + '</td>'
+      + '<td class="num" style="color:var(--muted)" title="' + esc(actPrTip) + '">' + (actProductivity != null ? pfmt.dec(actProductivity, 1) : '-') + '</td>'
+      + '<td class="num pp-prdct" style="font-weight:600" title="' + esc(planPrTip) + '">' + (planProductivity != null ? pfmt.dec(planProductivity, 1) : '-') + '</td>'
       + '<td><span style="color:var(--muted-2);font-size:11px">자동</span></td></tr>';
   });
 

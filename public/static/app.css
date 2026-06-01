@@ -162,6 +162,9 @@ table.tbl td{padding:11px 14px;border-bottom:1px solid var(--border);color:var(-
 table.tbl tr:last-child td{border-bottom:none}
 table.tbl tr:hover td{background:var(--blue-50)}
 table.tbl td.num,table.tbl th.num{text-align:right;font-variant-numeric:tabular-nums}
+/* 계산 산식 툴팁: title이 있는 셀은 hover 가능 표시(점선 밑줄 + help 커서) */
+table.tbl td[title]{cursor:help}
+table.tbl td[title]:hover{text-decoration:underline dotted var(--blue,#2563eb);text-underline-offset:3px}
 table.tbl tr.row-total td{background:var(--bg);font-weight:800;color:var(--ink)}
 table.tbl tr.row-total:hover td{background:var(--bg)}
 .cell-code{font-family:"SF Mono",ui-monospace,Menlo,monospace;font-size:12px;color:var(--muted)}
