@@ -885,7 +885,8 @@ PAGES.power = function () {
 
   var cur = powerCurrentMonthRec();
   var curIsActual = Period.isActual(cur.key);
-  var price = (PowerState.price != null) ? PowerState.price : (cur.rec ? cur.rec.priceAcct : 0);
+  // 전력단가는 대상월의 SAP 회계단가가 자동 적용(수정 불가)
+  var price = (cur.rec ? cur.rec.priceAcct : 0);
 
   var stepper = '<div class="stepper">'
     + '<div class="step done"><div class="step__dot"><i class="fas fa-check"></i></div><div class="step__lab">실적 수신</div></div><div class="step__line"></div>'
@@ -899,15 +900,16 @@ PAGES.power = function () {
     + '<div class="field" style="margin-bottom:12px"><label style="display:block;font-size:12px;color:var(--muted);margin-bottom:5px">대상 연 / 대상 월 <span style="color:var(--muted-2);font-size:11px">(기준월: ' + Period.cutoff.replace('-', '.') + ' · 전달까지 실적)</span></label>'
     + buildYearMonthSelect('pw', PowerState.month || defaultMonth()) + '</div>'
     + '<div id="pw_period" class="note" style="margin-bottom:12px;border-color:' + (curIsActual ? 'var(--muted-2,#94a3b8)' : 'var(--blue,#2563eb)') + ';color:' + (curIsActual ? 'var(--muted,#64748b)' : 'var(--blue-700,#1d4ed8)') + '"></div>'
-    + '<div class="field" style="margin-bottom:6px"><label style="display:block;font-size:12px;color:var(--muted);margin-bottom:5px">전력단가 (회계비용 기준) [원/kWh]</label>'
-    + '<input id="pw_price" type="number" step="0.01" value="' + price.toFixed(2) + '"' + (curIsActual ? ' disabled title="실적 확정월은 단가 조정 불가"' : '') + ' style="width:100%;padding:9px 11px;border:1px solid var(--border-2);border-radius:8px;font-family:inherit;text-align:right' + (curIsActual ? ';background:#f1f5f9;color:#94a3b8' : '') + '"></div>'
-    + '<div class="note" style="margin:12px 0"><i class="fas fa-circle-info"></i> 생산량·가동시간은 <b>예상 생산량 기준정보</b> 탭에서 입력합니다. 이 화면은 그 값을 자동 반영합니다. '
-    + '<br>전력사용량은 <b>가동시간 비례(A방식)</b>로 예측됩니다. '
+    + '<div class="field" style="margin-bottom:6px"><label style="display:block;font-size:12px;color:var(--muted);margin-bottom:5px">전력단가 (회계비용 기준) [원/kWh] '
+    + '<span style="color:var(--muted-2);font-size:11px"><i class="fas fa-lock"></i> 자동 적용 · 수정 불가</span></label>'
+    + '<input id="pw_price" type="text" value="' + ppComma(price.toFixed(2)) + '" readonly disabled title="대상월의 SAP 회계단가가 자동 적용됩니다 — 직접 수정할 수 없습니다" '
+    + 'style="width:100%;padding:9px 11px;border:1px solid var(--border-2);border-radius:8px;font-family:inherit;text-align:right;background:#f1f5f9;color:#475569;cursor:not-allowed"></div>'
+    + '<div class="note" style="margin:12px 0"><i class="fas fa-circle-info"></i> 전력단가는 대상월의 <b>SAP 회계단가</b>가 <b>자동 적용</b>되며 직접 수정할 수 없습니다. (월 변경 시 해당 월 단가로 자동 갱신)'
+    + '<br>생산량·가동시간은 <b>예상 생산량 기준정보</b> 탭에서 입력하며, 이 화면은 그 값을 자동 반영합니다. 전력사용량은 <b>가동시간 비례(A방식)</b>로 예측됩니다. '
     + (planSetCnt > 0 ? '<b style="color:var(--blue-700)">(예상값 ' + planSetCnt + '개 호기 적용 중)</b>' : '<span style="color:var(--muted-2)">(현재 실적값 사용)</span>') + '</div>'
     + '<button class="btn" style="width:100%" onclick="location.hash=\'prodplan\'"><i class="fas fa-industry"></i> 예상 생산량 기준정보 편집</button>'
     + '<hr class="hr">'
-    + '<button class="btn" style="width:100%" id="pw_resetprice"><i class="fas fa-rotate-left"></i> 단가 실적값으로 초기화</button>'
-    + '<button class="btn btn-primary" style="width:100%;margin-top:9px" onclick="location.hash=\'approval\'"><i class="fas fa-paper-plane"></i> 전력비 결과 상신</button>'
+    + '<button class="btn btn-primary" style="width:100%" onclick="location.hash=\'approval\'"><i class="fas fa-paper-plane"></i> 전력비 결과 상신</button>'
     + '</div></div>';
 
   var kpis = '<div class="grid g-3" id="pwKpis"></div>';
@@ -953,7 +955,7 @@ function powerRender() {
       var h = ProdPlan.get(cur.key, ln, 'hours'); if (h != null) o.hours = h;
       ov[ln] = o;
     });
-    if (PowerState.price != null) ov.price = PowerState.price;
+    // 전력단가는 항상 대상월의 SAP 회계단가(priceAcct) 자동 적용 — 사용자 수정 불가(override 없음)
     // 일자(평일/토요일/휴일) 사용자 입력 반영 (예상월만)
     var dov = ProdPlan.getDays(cur.key);
     if (dov) ov.days = dov;
@@ -1105,27 +1107,16 @@ AFTER.power = function () {
   if (ys) ys.addEventListener('change', function () {
     var prefNum = (PowerState.month || defaultMonth() || '').split('-')[1];
     var target = refreshMonthOptions('pw', prefNum);
-    if (target) { PowerState.month = target; PowerState.price = null; route(); }
+    if (target) { PowerState.month = target; route(); }
   });
 
   var ms = $('#pw_month');
   if (ms) ms.addEventListener('change', function () {
     PowerState.month = ms.value;
-    PowerState.price = null;
-    route(); // 월 변경 시 단가 리셋 + planSetCnt 갱신 위해 전체 재렌더
+    route(); // 월 변경 시 해당 월 단가 자동 적용 + planSetCnt 갱신 위해 전체 재렌더
   });
 
-  var ps = $('#pw_price');
-  if (ps) ps.addEventListener('input', function () {
-    PowerState.price = (ps.value === '') ? null : +ps.value;
-    powerRender();
-  });
-
-  var rb = $('#pw_resetprice');
-  if (rb) rb.addEventListener('click', function () {
-    PowerState.price = null;
-    route();
-  });
+  // 전력단가는 자동 적용(읽기전용) — 사용자 입력/초기화 핸들러 없음
 
   powerRender();
 };
