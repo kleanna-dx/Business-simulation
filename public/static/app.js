@@ -788,7 +788,11 @@ PAGES.power = function () {
   var tbl = '<div class="card"><div class="card__head"><h3>호기별 전력비 상세</h3><div class="grow"></div>'
     + '<span class="legend"><span class="l">' + tag('제지/화장지', 'TRANSFER') + 'kWh/ton</span><span class="l">' + tag('가공/생리대', 'SHIPMENT') + 'kWh/개</span></span></div>'
     + '<div class="note" style="margin:0 0 6px"><i class="fas fa-circle-info"></i> 전력사용량 = <b>모고객</b> + <b>ESS</b>(충전식: 보증량×(평일+토)×0.9)<br>'
-    + '<span style="color:var(--muted)">└ 모고객 = 호기 A방식(시간당전력×예상가동시간) + 공통설비배분(TOC·EDI·복합보일러NOX·에너지재활용 × 생산량비율) + 라미네이팅 고정값(제지2·3 동시 23,000 / 한 호기 15,000) <i class="fas fa-circle-question" title="모고객 셀에 마우스를 올리면 호기별 구성(A방식/공통배분/라미고정)이 표시됩니다"></i></span></div>'
+    + '<span style="color:var(--muted)">└ 모고객 = 호기 A방식(시간당전력×예상가동시간) + 공통설비배분(TOC·EDI·복합보일러NOX·에너지재활용 × 생산량비율) + 라미네이팅 고정값(제지2·3 동시 23,000 / 한 호기 15,000) <i class="fas fa-circle-question" title="모고객 셀에 마우스를 올리면 호기별 구성(A방식/공통배분/라미고정)이 표시됩니다"></i></span>'
+    + (curIsActual
+        ? '<br><span style="color:var(--muted-2)"><i class="fas fa-lock"></i> 실적 확정월 — SAP 실적이 그대로 표시됩니다.</span>'
+        : '<br><span style="color:var(--blue-700)"><span class="cell-plan"><i class="fas fa-pen"></i> 입력</span> 표시가 있는 셀은 <b>예상 생산량 기준정보(이동계획)</b> 탭에서 입력한 값이 반영된 것입니다. 표시가 없으면 실적값을 그대로 사용합니다.</span>')
+    + '</div>'
     + '<div class="tbl-wrap" style="border:none;border-radius:0"><table class="tbl"><thead><tr>'
     + '<th>호기</th><th class="num">가동시간 [Hr]</th><th class="num">모고객 [kWh]</th><th class="num">ESS [kWh]</th><th class="num">사용량 합계 [kWh]</th><th class="num">생산량</th><th class="num">전력원단위</th>'
     + '<th class="num">전력비원단위</th><th class="num">전력비 [원]</th><th>변동</th>'
@@ -864,6 +868,9 @@ function powerRender() {
     var unitU = isPaper ? 'kWh/ton' : 'kWh/개';
     var costU = isPaper ? '천원/ton' : '원/개';
     var prodU = isPaper ? 'kg' : 'EA';
+    // 이 호기에 사용자가 이동계획(예상값)을 직접 입력했는지 (예상월에서만 의미)
+    var prodInput = !isActual && ProdPlan.isSet(cur.key, r.line, 'prod');
+    var hoursInput = !isActual && ProdPlan.isSet(cur.key, r.line, 'hours');
     // 변동: 생산량 또는 가동시간이 실적과 다른지
     var prodChanged = Math.abs(r.prod - r.baseProd) > 0.5;
     var hoursChanged = (r.planHours != null && r.baseHours != null) ? (Math.abs(r.planHours - r.baseHours) > 0.05) : false;
@@ -874,9 +881,11 @@ function powerRender() {
     } else {
       deltaCell = '<span style="color:var(--muted-2);font-size:11px">실적</span>';
     }
+    // 이동계획 입력값 반영 표시 배지 (예상월 + 해당 호기 입력 시)
+    var inBadge = '<span class="cell-plan" title="예상 생산량 기준정보(이동계획) 탭에서 입력한 값이 반영됨"><i class="fas fa-pen"></i> 입력</span>';
     // 가동시간 셀 (B방식 fallback이면 표시)
     var hoursCell = (r.planHours != null)
-      ? pfmt.dec(r.planHours, 0)
+      ? (pfmt.dec(r.planHours, 0) + (hoursInput ? ' ' + inBadge : ''))
       : '<span style="color:var(--muted-2);font-size:11px" title="실적 가동시간 없음 → 생산량 기준(B방식)">N/A</span>';
     var modeBadge = (r.usageMode === 'B') ? ' <span class="cell-code" title="가동시간 실적 없음: 실적 모고객 사용량 그대로 사용">B</span>'
       : (r.usageMode === 'lami') ? ' <span class="cell-code" title="라미네이팅 고정값: 제지2·제지3 모두 가동=23,000 / 하나만=15,000 / 미가동=0">고정</span>'
@@ -901,7 +910,9 @@ function powerRender() {
       ? 'ESS(충전식) = 충전보증량 ' + pfmt.dec(r.essGuarantee, 1) + ' × (평일+토 ' + pfmt.int(r.essGuarantee > 0 ? r.usageEss / (r.essGuarantee * 0.9) : 0) + '일) × 효율 0.9\n= ' + pfmt.int(r.usageEss) + ' kWh'
       : 'ESS = 실적값 ' + pfmt.int(r.usageEss) + ' kWh (충전보증량/일자 미설정)';
     var usageTip = '사용량 합계 = 모고객 ' + pfmt.int(r.usageMo) + ' + ESS ' + pfmt.int(r.usageEss) + '\n= ' + pfmt.int(r.usage) + ' kWh';
-    var prodTip = '생산량 = ' + pfmt.int(r.prod) + ' ' + prodU + (Math.abs(r.prod - r.baseProd) > 0.5 ? ' (이동계획 입력, 실적 ' + pfmt.int(r.baseProd) + ')' : ' (실적)');
+    var prodTip = '생산량 = ' + pfmt.int(r.prod) + ' ' + prodU
+      + (prodInput ? ' (이동계획 탭에서 직접 입력한 예상값, 실적 ' + pfmt.int(r.baseProd) + ')'
+          : (!isActual ? ' (이동계획 미입력 → 실적값 사용)' : ' (실적)'));
     var unitTip = isPaper
       ? '전력원단위 = 사용량 ÷ 생산량 × 1000\n= ' + pfmt.int(r.usage) + ' ÷ ' + pfmt.int(r.prod) + ' × 1000 = ' + pfmt.dec(r.unit, 2) + ' kWh/ton'
       : '전력원단위 = 사용량 ÷ 생산량\n= ' + pfmt.int(r.usage) + ' ÷ ' + pfmt.int(r.prod) + ' = ' + pfmt.dec(r.unit, 4) + ' kWh/개';
@@ -911,11 +922,11 @@ function powerRender() {
     var costTip = '전력비 = 사용량 × 단가\n= ' + pfmt.int(r.usage) + ' × ' + pfmt.dec(r.price, 2) + ' = ' + pfmt.won(r.cost) + ' 원';
 
     return '<tr><td><b>' + r.line + '</b> <span class="cell-code">' + (isPaper ? 'PAPER' : 'PROC') + '</span></td>'
-      + '<td class="num" title="' + esc(hoursTip) + '">' + hoursCell + '</td>'
+      + '<td class="num' + (hoursInput ? ' pw-input' : '') + '" title="' + esc(hoursTip) + '">' + hoursCell + '</td>'
       + '<td class="num" title="' + esc(moTip) + '">' + pfmt.int(r.usageMo) + modeBadge + '</td>'
       + '<td class="num" title="' + esc(essTip) + '">' + pfmt.int(r.usageEss) + essBadge + '</td>'
       + '<td class="num" title="' + esc(usageTip) + '"><b>' + pfmt.int(r.usage) + '</b></td>'
-      + '<td class="num" title="' + esc(prodTip) + '">' + pfmt.int(r.prod) + ' <span style="color:var(--muted-2);font-size:10px">' + prodU + '</span></td>'
+      + '<td class="num' + (prodInput ? ' pw-input' : '') + '" title="' + esc(prodTip) + '">' + pfmt.int(r.prod) + ' <span style="color:var(--muted-2);font-size:10px">' + prodU + '</span>' + (prodInput ? ' ' + inBadge : '') + '</td>'
       + '<td class="num" title="' + esc(unitTip) + '">' + pfmt.dec(r.unit, isPaper ? 2 : 4) + ' <span style="color:var(--muted-2);font-size:10px">' + unitU + '</span></td>'
       + '<td class="num" title="' + esc(costUnitTip) + '">' + pfmt.dec(r.costUnit, isPaper ? 2 : 4) + ' <span style="color:var(--muted-2);font-size:10px">' + costU + '</span></td>'
       + '<td class="num" title="' + esc(costTip) + '"><b>' + pfmt.won(r.cost) + '</b></td>'
