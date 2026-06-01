@@ -10,6 +10,7 @@ var NAV = [
   { id: 'sapsync', icon: 'fa-rotate', label: 'SAP BW 수신', star: true },
   { id: 'master', icon: 'fa-layer-group', label: '자재 마스터' },
   { id: 'prodplan', icon: 'fa-industry', label: '예상 생산량 기준정보', star: true },
+  { id: 'costbase', icon: 'fa-bolt', label: '전력비 기준정보', star: true },
   { g: '계획 · 시뮬레이션' },
   { id: 'plan', icon: 'fa-clipboard-list', label: '생산·원가 계획' },
   { id: 'movement', icon: 'fa-truck-fast', label: '이동 계획', star: true },
@@ -30,6 +31,7 @@ var TITLES = {
   actual:    ['실적 입력', '월 실적 원단위 입력 및 검증'],
   sim:       ['사전원가 시뮬레이션', '슬라이더로 변수 조정 → 원가·차이 실시간 계산'],
   prodplan:  ['예상 생산량 기준정보', '호기·월별 예상 생산량 입력(또는 엑셀 업로드) → 전 시뮬레이션 공통 기준'],
+  costbase:  ['전력비 기준정보', '요금 단가(기본/경·중·최대부하 등) 및 ESS 충전 일자 입력 → 전력비 산출 기준'],
   power:     ['전력비 시뮬레이션', '예상 생산량 기준정보 자동 반영 · 단가 조정 → 전력원단위·전력비 실시간 계산'],
   ai:        ['AI 분석 어시스턴트', '자연어로 원가 차이 원인 분석'],
   approval:  ['승인 워크플로', '사전원가 확정 결재 진행 현황']
@@ -677,6 +679,104 @@ var ProdPlan = {
 ProdPlan.loadStorage();
 
 /* ============================================================
+   전력비 기준정보 — 요금 단가 (Power Rate)
+   - 월별 요금 단가 [원/kWh]: 기본요금 / 경부하 / 중부하 / 최대부하 / 기후환경 / 연료비조정 / 단가인상(예상)
+   - 비워둔(미입력) 월은 직전(가장 가까운 과거) 입력월 단가를 승계.
+   - 현재는 localStorage(precost_power_rate_v1). 추후 MariaDB로 이관.
+
+   [MariaDB 매핑 — 추후 연동]
+   CREATE TABLE power_rate (
+     period       DATE PRIMARY KEY,        -- 대상월 (rate.month 'YYYY-MM' → 1일)
+     base_fee     DECIMAL(12,2) NULL,      -- 기본요금  (rate.base)
+     off_peak     DECIMAL(12,2) NULL,      -- 경부하    (rate.off)
+     mid_peak     DECIMAL(12,2) NULL,      -- 중부하    (rate.mid)
+     max_peak     DECIMAL(12,2) NULL,      -- 최대부하  (rate.max)
+     climate      DECIMAL(12,2) NULL,      -- 기후환경  (rate.climate)
+     fuel_adj     DECIMAL(12,2) NULL,      -- 연료비 조정(rate.fuel)
+     price_up     DECIMAL(12,2) NULL,      -- 단가 인상(예상) (rate.up)
+     updated_by   VARCHAR(64) NULL,
+     updated_at   DATETIME NULL
+   );
+   ============================================================ */
+var PowerRate = {
+  STORAGE_KEY: 'precost_power_rate_v1',
+  // 요금 단가 항목 정의 (표시 순서)
+  FIELDS: [
+    { key: 'base',    label: '기본요금',        unit: '원/kW' },
+    { key: 'off',     label: '경부하',          unit: '원/kWh' },
+    { key: 'mid',     label: '중부하',          unit: '원/kWh' },
+    { key: 'max',     label: '최대부하',        unit: '원/kWh' },
+    { key: 'climate', label: '기후환경',        unit: '원/kWh' },
+    { key: 'fuel',    label: '연료비 조정',     unit: '원/kWh' },
+    { key: 'up',      label: '단가 인상 (예상)', unit: '원/kWh' }
+  ],
+  // 기본(시드) 단가 — 사용자 제공 샘플값. 미입력 월의 표시 기준.
+  DEFAULT: { base: 8190.0, off: 127.9, mid: 173.1, max: 229.3, climate: 9.0, fuel: 5.0, up: null },
+  // 6월 이후(예상 시즌) 샘플 — 경/중/최대부하 인하 반영
+  DEFAULT_SUMMER: { base: 8190.0, off: 120.8, mid: 143.2, max: 173.5, climate: 9.0, fuel: 5.0, up: null },
+  rate: {},   // { 'YYYY-MM': {base,off,mid,max,climate,fuel,up} }
+  loadStorage: function () {
+    try {
+      var raw = localStorage.getItem(this.STORAGE_KEY);
+      this.rate = raw ? JSON.parse(raw) : {};
+    } catch (e) { this.rate = {}; }
+  },
+  saveStorage: function () {
+    try { localStorage.setItem(this.STORAGE_KEY, JSON.stringify(this.rate)); } catch (e) {}
+  },
+  // 입력 레코드(있으면) 반환
+  recRaw: function (month) { return this.rate[month] || null; },
+  isSet: function (month, key) {
+    var r = this.rate[month];
+    return !!(r && r[key] != null);
+  },
+  isAnySet: function (month) {
+    var r = this.rate[month];
+    if (!r) return false;
+    return this.FIELDS.some(function (f) { return r[f.key] != null; });
+  },
+  // 단일 항목값: 입력값 우선 → 직전 입력월 승계 → 시드 기본값
+  get: function (month, key) {
+    var r = this.rate[month];
+    if (r && r[key] != null) return +r[key];
+    // 직전(가장 가까운 과거) 입력월 승계
+    var inherited = this._inheritFrom(month, key);
+    if (inherited != null) return inherited;
+    // 시드 기본값(여름철 구분)
+    var seed = this._seedFor(month);
+    return seed[key];
+  },
+  _seedFor: function (month) {
+    // 6~8월(하계)은 SUMMER 샘플, 그 외 DEFAULT
+    var mm = +(month || '').split('-')[1];
+    return (mm >= 6 && mm <= 8) ? this.DEFAULT_SUMMER : this.DEFAULT;
+  },
+  _inheritFrom: function (month, key) {
+    var keys = Object.keys(this.rate).filter(function (m) { return m < month; }).sort();
+    for (var i = keys.length - 1; i >= 0; i--) {
+      var r = this.rate[keys[i]];
+      if (r && r[key] != null) return +r[key];
+    }
+    return null;
+  },
+  // 전체 레코드(표시용): 모든 항목을 get으로 채워 반환
+  rec: function (month) {
+    var self = this, out = {};
+    this.FIELDS.forEach(function (f) { out[f.key] = self.get(month, f.key); });
+    return out;
+  },
+  set: function (month, key, val) {
+    if (!this.rate[month]) this.rate[month] = {};
+    if (val == null || val === '' || isNaN(+val)) { delete this.rate[month][key]; }
+    else { this.rate[month][key] = +val; }
+    if (Object.keys(this.rate[month]).length === 0) delete this.rate[month];
+    this.saveStorage();
+  },
+  clearMonth: function (month) { delete this.rate[month]; this.saveStorage(); }
+};
+PowerRate.loadStorage();
+
+/* ============================================================
    예상 생산량 기준정보 — 변경 이력 (Change History)
    - 월별로 "변경 저장" 시 스냅샷 1건 기록: 변경ID / 일시 / 변경자 / 사유 / 변경 항목(before→after)
    - 현재는 localStorage(precost_prodplan_hist_v1). 추후 MariaDB로 이관.
@@ -1175,30 +1275,11 @@ PAGES.prodplan = function () {
     + '<div id="pp_uploadmsg" style="margin-top:10px"></div>'
     + '</div></div>';
 
-  // 일자(평일/토요일/휴일) 입력 카드 — ESS 충전식 계산에 사용
-  var dWeek = ProdPlan.getDay(cur, 'weekday');
-  var dSat = ProdPlan.getDay(cur, 'sat');
-  var dHol = ProdPlan.getDay(cur, 'holiday');
-  var daySet = ProdPlan.isDaySet(cur, 'weekday') || ProdPlan.isDaySet(cur, 'sat') || ProdPlan.isDaySet(cur, 'holiday');
-  var dayDisabled = curIsActual ? ' disabled title="실적 확정월 — 수정 금지"' : '';
-  var dayInputStyle = 'width:100%;padding:8px 10px;border:1px solid var(--border-2);border-radius:8px;font-family:inherit;text-align:right' + (curIsActual ? ';background:#f1f5f9;color:#94a3b8;cursor:not-allowed' : '');
-  function dayField(id, lab, val) {
-    return '<div class="field"><label style="display:block;font-size:12px;color:var(--muted);margin-bottom:5px">' + lab + '</label>'
-      + '<input id="' + id + '" type="number" min="0" step="1" value="' + (val == null ? '' : val) + '"' + dayDisabled + ' style="' + dayInputStyle + '"></div>';
-  }
-  var dayCard = '<div class="card" style="margin-top:16px"><div class="card__head"><h3><i class="fas fa-calendar-days" style="color:var(--blue);margin-right:7px"></i>일자 입력 (ESS 충전 기준)</h3>'
-    + '<div class="grow"></div>' + (curIsActual ? tag('실적 확정', 'INBOUND') : (daySet ? tag('입력값 적용', 'TRANSFER') : tag(curIsActual ? '실적값 사용' : '미입력', 'SHIPMENT'))) + '</div><div class="card__body">'
-    + '<div class="note" style="margin-bottom:12px"><i class="fas fa-circle-info"></i> ESS 충전 사용량 = <b>ESS충전보증량 × (평일 + 토요일) × 효율(0.9)</b>. '
-    + '토요일은 <b>휴일(대체)</b>로 처리되며, 충전 가동일 = 평일 + 토요일입니다.</div>'
-    + '<div class="grid" style="grid-template-columns:1fr 1fr 1fr 1.2fr;gap:12px;align-items:end">'
-    + dayField('pp_dweek', '평일 [일]', dWeek)
-    + dayField('pp_dsat', '토요일 [일]', dSat)
-    + dayField('pp_dhol', '휴일 [일]', dHol)
-    + '<div class="field"><label style="display:block;font-size:12px;color:var(--muted);margin-bottom:5px">충전 가동일 / 총일수</label>'
-    + '<div id="pp_daysum" style="padding:9px 11px;border:1px dashed var(--border-2);border-radius:8px;text-align:right;font-weight:600;color:var(--blue-700,#1d4ed8)"></div></div>'
-    + '</div>'
-    + (curIsActual ? '' : '<button class="btn" id="pp_resetdays" style="margin-top:10px"><i class="fas fa-rotate-left"></i> 일자 입력 초기화(비우기)</button>')
-    + '</div></div>';
+  // ※ 일자 입력(ESS 충전 기준) 카드는 '전력비 기준정보' 탭으로 이동했습니다.
+  //    여기서는 안내 링크만 표시합니다.
+  var dayLinkCard = '<div class="note" style="margin-top:16px;border-color:var(--blue,#2563eb);color:var(--blue-700,#1d4ed8)">'
+    + '<i class="fas fa-arrow-right-from-bracket"></i> ESS 충전 기준이 되는 <b>일자 입력(평일/토요일/휴일)</b>과 <b>요금 단가</b>는 '
+    + '<a href="#costbase" style="color:var(--blue,#2563eb);font-weight:700;text-decoration:underline">전력비 기준정보</a> 탭에서 입력합니다.</div>';
 
   var summary = '<div class="grid g-3" id="ppKpis" style="margin-top:16px"></div>';
 
@@ -1217,7 +1298,7 @@ PAGES.prodplan = function () {
   // 변경 이력 카드 (월별)
   var histCard = prodplanHistoryCard(cur);
 
-  return head + dayCard + summary + tbl + histCard;
+  return head + dayLinkCard + summary + tbl + histCard;
 };
 
 // 월별 변경 이력 카드 HTML
@@ -1370,15 +1451,7 @@ function prodplanShowHistDetail(month, idx) {
 }
 
 // 일자 합계 표시 갱신
-function prodplanRenderDaySum() {
-  var el = $('#pp_daysum');
-  if (!el) return;
-  var cur = prodplanCurrentMonth();
-  var w = ProdPlan.getDay(cur, 'weekday') || 0;
-  var s = ProdPlan.getDay(cur, 'sat') || 0;
-  var h = ProdPlan.getDay(cur, 'holiday') || 0;
-  el.innerHTML = (w + s) + '일 <span style="color:var(--muted-2);font-size:11px;font-weight:400">/ 총 ' + (w + s + h) + '일</span>';
-}
+// ※ prodplanRenderDaySum()은 '전력비 기준정보' 탭(costbaseRenderDaySum)으로 이동했습니다.
 
 // 가동 여부(실적 생산량 또는 사용량이 있는 호기만 표시)
 function ppActiveLine(month, ln) {
@@ -1637,29 +1710,7 @@ AFTER.prodplan = function () {
     route();
   });
 
-  // 일자(평일/토요일/휴일) 입력
-  function bindDay(id, field) {
-    var el = $('#' + id);
-    if (!el) return;
-    el.addEventListener('input', function () {
-      var cur = prodplanCurrentMonth();
-      if (Period.isActual(cur)) return; // 실적월 — 수정 금지
-      ProdPlan.setDay(cur, field, el.value === '' ? null : +el.value);
-      prodplanRenderDaySum();
-    });
-  }
-  bindDay('pp_dweek', 'weekday');
-  bindDay('pp_dsat', 'sat');
-  bindDay('pp_dhol', 'holiday');
-  var rd = $('#pp_resetdays');
-  if (rd) rd.addEventListener('click', function () {
-    var cur = prodplanCurrentMonth();
-    ProdPlan.setDay(cur, 'weekday', null);
-    ProdPlan.setDay(cur, 'sat', null);
-    ProdPlan.setDay(cur, 'holiday', null);
-    route();
-  });
-  prodplanRenderDaySum();
+  // ※ 일자(평일/토요일/휴일) 입력 핸들러는 '전력비 기준정보' 탭(AFTER.costbase)으로 이동했습니다.
 
   // 입력 이벤트(위임): pp_in (data-field: prod|hours)
   // 입력 중에는 쉼표 제거값으로 저장만(커서 튐 방지), 포커스 아웃(blur) 시 3자리 쉼표로 재표시
@@ -1727,6 +1778,171 @@ function prodplanUpdateRow(ln) {
 
   prodplanRenderKpis();
 }
+
+/* ============================================================
+   전력비 기준정보 (costbase)
+   - 요금 단가 [원/kWh] 입력표 (기본/경·중·최대부하/기후환경/연료비조정/단가인상)
+   - ESS 충전 기준 일자 입력(평일/토요일/휴일) — 예상 생산량 기준정보 탭에서 이전
+   ============================================================ */
+var CostBaseState = { month: null };
+function costbaseCurrentMonth() { return CostBaseState.month || defaultMonth(); }
+
+// 요금 단가 숫자 표시: 천단위 쉼표 + 소수 1자리
+function cbRateDisp(v) {
+  if (v == null || isNaN(+v)) return '';
+  return (+v).toLocaleString('en-US', { minimumFractionDigits: 1, maximumFractionDigits: 2 });
+}
+
+PAGES.costbase = function () {
+  if (!PowerDB.hasData()) return emptyState('전력비 기준이 되는 데이터가 없습니다. 운영에서는 SAP/엑셀 연동 후 요금 단가·일자 정보가 표시됩니다.');
+
+  var cur = costbaseCurrentMonth();
+  var curIsActual = Period.isActual(cur);
+
+  // ── 헤더 / 월 선택 ──
+  var head = '<div class="card"><div class="card__head"><h3><i class="fas fa-bolt" style="color:var(--blue);margin-right:7px"></i>전력비 기준정보</h3>'
+    + '<div class="grow"></div>' + tag('전력비 산출 기준', 'INBOUND') + '</div><div class="card__body">'
+    + '<div class="note" style="margin-bottom:14px"><i class="fas fa-circle-info"></i> 전력비 산출에 사용되는 <b>요금 단가</b>와 <b>ESS 충전 기준 일자</b>를 월별로 입력합니다. '
+    + '비워둔(미입력) 단가는 <b>직전 입력월 단가</b> 또는 <b>기본 단가</b>가 자동 승계됩니다.</div>'
+    + '<div class="note" style="margin-bottom:14px;border-color:' + (curIsActual ? 'var(--muted-2,#94a3b8)' : 'var(--blue,#2563eb)') + ';color:' + (curIsActual ? 'var(--muted,#64748b)' : 'var(--blue-700,#1d4ed8)') + '">'
+    + (curIsActual
+        ? '<i class="fas fa-lock"></i> <b>' + cur.replace('-', '.') + '</b> 은(는) <b>실적 확정월</b>입니다(기준월 ' + Period.cutoff.replace('-', '.') + ' 전달까지). 단가/일자 <b>수정이 금지</b>됩니다.'
+        : '<i class="fas fa-pen-to-square"></i> <b>' + cur.replace('-', '.') + '</b> 은(는) <b>예상월</b>입니다(기준월 ' + Period.cutoff.replace('-', '.') + ' 포함 이후). 요금 단가·일자를 입력하세요.') + '</div>'
+    + '<div class="field" style="max-width:340px"><label style="display:block;font-size:12px;color:var(--muted);margin-bottom:5px">대상 연 / 대상 월</label>'
+    + buildYearMonthSelect('cb', cur) + '</div>'
+    + '</div></div>';
+
+  // ── 요금 단가 입력표 ──
+  var anySet = PowerRate.isAnySet(cur);
+  var rDisabled = curIsActual ? ' disabled title="실적 확정월 — 수정 금지"' : '';
+  var rInputStyle = 'width:100%;padding:8px 10px;border:1px solid var(--border-2);border-radius:8px;font-family:inherit;text-align:right'
+    + (curIsActual ? ';background:#f1f5f9;color:#94a3b8;cursor:not-allowed' : '');
+
+  var rateHeadCells = PowerRate.FIELDS.map(function (f) {
+    return '<th class="num">' + f.label + '<br><span style="font-weight:400;color:var(--muted-2);font-size:11px">[' + f.unit + ']</span></th>';
+  }).join('');
+  var rateBodyCells = PowerRate.FIELDS.map(function (f) {
+    var v = PowerRate.get(cur, f.key);
+    var isInput = PowerRate.isSet(cur, f.key);
+    return '<td class="num" style="' + (isInput && !curIsActual ? 'background:var(--blue-50,#eff6ff)' : '') + '">'
+      + '<input class="cb_rate" data-key="' + f.key + '" type="text" inputmode="decimal" value="' + esc(cbRateDisp(v)) + '"'
+      + rDisabled + ' style="' + rInputStyle + '"></td>';
+  }).join('');
+
+  var rateCard = '<div class="card" style="margin-top:16px"><div class="card__head"><h3><i class="fas fa-won-sign" style="color:var(--blue);margin-right:7px"></i>요금 단가 <span style="font-size:12px;color:var(--muted)">(' + cur.replace('-', '.') + ')</span></h3>'
+    + '<div class="grow"></div>'
+    + '<span id="cb_ratebadge">' + (curIsActual ? tag('실적 확정', 'INBOUND') : (anySet ? tag('입력값 적용', 'TRANSFER') : tag('기본 단가', 'SHIPMENT'))) + '</span>'
+    + (curIsActual ? '' : '<button class="btn" id="cb_resetrate" style="margin-left:9px"><i class="fas fa-rotate-left"></i> 단가 입력 초기화</button>')
+    + '</div>'
+    + '<div class="tbl-wrap" style="border:none;border-radius:0"><table class="tbl"><thead><tr>' + rateHeadCells + '</tr></thead>'
+    + '<tbody><tr>' + rateBodyCells + '</tr></tbody></table></div>'
+    + '<div class="note" style="margin:10px 14px 4px"><i class="fas fa-circle-info"></i> 요금 단가는 <b>원/kWh</b> 기준이며(기본요금은 원/kW), 숫자는 자동으로 3자리마다 쉼표가 표시됩니다. '
+    + '미입력 칸은 직전 입력월 또는 기본 단가가 승계되어 표시됩니다.'
+    + (curIsActual ? '' : '<br>입력값은 즉시 저장됩니다.') + '</div></div>';
+
+  // ── ESS 충전 기준 일자 입력 카드 (예상 생산량 기준정보 탭에서 이전) ──
+  var dWeek = ProdPlan.getDay(cur, 'weekday');
+  var dSat = ProdPlan.getDay(cur, 'sat');
+  var dHol = ProdPlan.getDay(cur, 'holiday');
+  var daySet = ProdPlan.isDaySet(cur, 'weekday') || ProdPlan.isDaySet(cur, 'sat') || ProdPlan.isDaySet(cur, 'holiday');
+  var dayInputStyle = 'width:100%;padding:8px 10px;border:1px solid var(--border-2);border-radius:8px;font-family:inherit;text-align:right' + (curIsActual ? ';background:#f1f5f9;color:#94a3b8;cursor:not-allowed' : '');
+  function cbDayField(id, lab, val) {
+    return '<div class="field"><label style="display:block;font-size:12px;color:var(--muted);margin-bottom:5px">' + lab + '</label>'
+      + '<input id="' + id + '" type="number" min="0" step="1" value="' + (val == null ? '' : val) + '"' + rDisabled + ' style="' + dayInputStyle + '"></div>';
+  }
+  var dayCard = '<div class="card" style="margin-top:16px"><div class="card__head"><h3><i class="fas fa-calendar-days" style="color:var(--blue);margin-right:7px"></i>일자 입력 (ESS 충전 기준)</h3>'
+    + '<div class="grow"></div>' + (curIsActual ? tag('실적 확정', 'INBOUND') : (daySet ? tag('입력값 적용', 'TRANSFER') : tag('실적값 사용', 'SHIPMENT'))) + '</div><div class="card__body">'
+    + '<div class="note" style="margin-bottom:12px"><i class="fas fa-circle-info"></i> ESS 충전 사용량 = <b>ESS충전보증량 × (평일 + 토요일) × 효율(0.9)</b>. '
+    + '토요일은 <b>휴일(대체)</b>로 처리되며, 충전 가동일 = 평일 + 토요일입니다.</div>'
+    + '<div class="grid" style="grid-template-columns:1fr 1fr 1fr 1.2fr;gap:12px;align-items:end">'
+    + cbDayField('cb_dweek', '평일 [일]', dWeek)
+    + cbDayField('cb_dsat', '토요일 [일]', dSat)
+    + cbDayField('cb_dhol', '휴일 [일]', dHol)
+    + '<div class="field"><label style="display:block;font-size:12px;color:var(--muted);margin-bottom:5px">충전 가동일 / 총일수</label>'
+    + '<div id="cb_daysum" style="padding:9px 11px;border:1px dashed var(--border-2);border-radius:8px;text-align:right;font-weight:600;color:var(--blue-700,#1d4ed8)"></div></div>'
+    + '</div>'
+    + (curIsActual ? '' : '<button class="btn" id="cb_resetdays" style="margin-top:10px"><i class="fas fa-rotate-left"></i> 일자 입력 초기화(비우기)</button>')
+    + '</div></div>';
+
+  return head + rateCard + dayCard;
+};
+
+function costbaseRenderDaySum() {
+  var el = $('#cb_daysum');
+  if (!el) return;
+  var cur = costbaseCurrentMonth();
+  var w = ProdPlan.getDay(cur, 'weekday') || 0;
+  var s = ProdPlan.getDay(cur, 'sat') || 0;
+  var h = ProdPlan.getDay(cur, 'holiday') || 0;
+  el.innerHTML = (w + s) + '일 <span style="color:var(--muted-2);font-size:11px;font-weight:400">/ 총 ' + (w + s + h) + '일</span>';
+}
+
+AFTER.costbase = function () {
+  if (!PowerDB.hasData()) return;
+
+  // 연/월 선택
+  var ys = $('#cb_year');
+  if (ys) ys.addEventListener('change', function () {
+    var prefNum = (CostBaseState.month || defaultMonth() || '').split('-')[1];
+    var target = refreshMonthOptions('cb', prefNum);
+    if (target) { CostBaseState.month = target; route(); }
+  });
+  var ms = $('#cb_month');
+  if (ms) ms.addEventListener('change', function () { CostBaseState.month = ms.value; route(); });
+
+  // 요금 단가 입력: cb_rate (data-key) — 개별 바인딩
+  $all('.cb_rate').forEach(function (inp) {
+    inp.addEventListener('input', function () {
+      var cur = costbaseCurrentMonth();
+      if (Period.isActual(cur)) return; // 실적 확정월 — 수정 금지
+      var key = inp.getAttribute('data-key');
+      var cleaned = inp.value.replace(/[^\d.,]/g, '');
+      if (cleaned !== inp.value) inp.value = cleaned;
+      var n = (inp.value === '') ? null : +inp.value.replace(/,/g, '');
+      PowerRate.set(cur, key, (n == null || isNaN(n)) ? null : n);
+      // 입력 상태 배지 갱신
+      var badge = $('#cb_ratebadge');
+      if (badge) badge.innerHTML = PowerRate.isAnySet(cur) ? tag('입력값 적용', 'TRANSFER') : tag('기본 단가', 'SHIPMENT');
+      // 입력칸 배경(강조) 갱신
+      inp.closest('td').style.background = PowerRate.isSet(cur, key) ? 'var(--blue-50,#eff6ff)' : '';
+    });
+    inp.addEventListener('focusout', function () {
+      if (inp.value !== '') {
+        var n = +inp.value.replace(/,/g, '');
+        if (!isNaN(n)) inp.value = cbRateDisp(n);
+      }
+    });
+  });
+  var rr = $('#cb_resetrate');
+  if (rr) rr.addEventListener('click', function () {
+    PowerRate.clearMonth(costbaseCurrentMonth());
+    route();
+  });
+
+  // ESS 일자 입력
+  function bindDay(id, field) {
+    var el = $('#' + id);
+    if (!el) return;
+    el.addEventListener('input', function () {
+      var cur = costbaseCurrentMonth();
+      if (Period.isActual(cur)) return; // 실적월 — 수정 금지
+      ProdPlan.setDay(cur, field, el.value === '' ? null : +el.value);
+      costbaseRenderDaySum();
+    });
+  }
+  bindDay('cb_dweek', 'weekday');
+  bindDay('cb_dsat', 'sat');
+  bindDay('cb_dhol', 'holiday');
+  var rd = $('#cb_resetdays');
+  if (rd) rd.addEventListener('click', function () {
+    var cur = costbaseCurrentMonth();
+    ProdPlan.setDay(cur, 'weekday', null);
+    ProdPlan.setDay(cur, 'sat', null);
+    ProdPlan.setDay(cur, 'holiday', null);
+    route();
+  });
+  costbaseRenderDaySum();
+};
 
 /* ====================== AI 분석 어시스턴트 (slide 9) ====================== */
 var AI_SUGGEST = [
