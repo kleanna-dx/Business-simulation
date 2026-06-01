@@ -1002,6 +1002,11 @@ AFTER.power = function () {
 function prodplanCurrentMonth() {
   return ProdPlanState.month || defaultMonth();
 }
+/* 해당 월에 SAP 실적이 존재하는가? = 기준월(cutoff) 이전(과거)만 실적 있음.
+   현재월·미래월은 아직 실적이 수신되지 않았으므로 '실적 없음'으로 취급. */
+function prodplanHasActual(month) {
+  return Period.isActual(month);
+}
 // 표시단위/입력단위 환산: 제지·화장지=톤(=kg/1000), 가공·생리대=천개(=EA/1000), 라미네이팅=EA(환산 1)
 function ppDispUnit(ln) { return (PowerDB.unit && PowerDB.unit[ln]) || ((PowerDB.lineType[ln] === 'paper') ? '톤' : 'EA'); }
 function ppFactor(ln) { var u = ppDispUnit(ln); return (u === '톤' || u === '천개') ? 1000 : 1; } // 내부 = 표시 × factor
@@ -1020,7 +1025,8 @@ PAGES.prodplan = function () {
   var head = '<div class="card"><div class="card__head"><h3><i class="fas fa-industry" style="color:var(--blue);margin-right:7px"></i>예상 생산량 기준정보 (이동계획)</h3>'
     + '<div class="grow"></div>' + tag('전 시뮬레이션 공통', 'INBOUND') + '</div><div class="card__body">'
     + '<div class="note" style="margin-bottom:14px"><i class="fas fa-circle-info"></i> 호기별 <b>예상 생산량</b>과 <b>가동시간</b>을 입력하면 전력비 등 모든 원가 시뮬레이션의 공통 기준이 됩니다. '
-    + '<b>생산성(생산량/일)</b>은 자동 계산되며, 비워둔 항목은 <b>실적값</b>을 그대로 사용합니다.<br>'
+    + '<b>생산성(생산량/일)</b>은 자동 계산되며, 비워둔 항목은 ' + (curIsActual ? '<b>실적값</b>을 그대로 사용합니다.' : '<b>직전 추세 기준값</b>으로 산출됩니다.') + '<br>'
+    + (curIsActual ? '' : '<b>※ 미래월(예상월)은 SAP 실적이 아직 없으므로 “실적” 칸은 <span style="color:var(--muted-2)">-</span> 로 표시됩니다.</b><br>')
     + '전력사용량은 <b>가동시간 비례(A방식)</b>로 예측됩니다: 시간당 전력(실적) × 예상 가동시간.</div>'
     + '<div class="note" style="margin-bottom:14px;border-color:' + (curIsActual ? 'var(--muted-2,#94a3b8)' : 'var(--blue,#2563eb)') + ';color:' + (curIsActual ? 'var(--muted,#64748b)' : 'var(--blue-700,#1d4ed8)') + '">'
     + (curIsActual
@@ -1049,7 +1055,7 @@ PAGES.prodplan = function () {
       + '<input id="' + id + '" type="number" min="0" step="1" value="' + (val == null ? '' : val) + '"' + dayDisabled + ' style="' + dayInputStyle + '"></div>';
   }
   var dayCard = '<div class="card" style="margin-top:16px"><div class="card__head"><h3><i class="fas fa-calendar-days" style="color:var(--blue);margin-right:7px"></i>일자 입력 (ESS 충전 기준)</h3>'
-    + '<div class="grow"></div>' + (curIsActual ? tag('실적 확정', 'INBOUND') : (daySet ? tag('입력값 적용', 'TRANSFER') : tag('실적값 사용', 'SHIPMENT'))) + '</div><div class="card__body">'
+    + '<div class="grow"></div>' + (curIsActual ? tag('실적 확정', 'INBOUND') : (daySet ? tag('입력값 적용', 'TRANSFER') : tag(curIsActual ? '실적값 사용' : '미입력', 'SHIPMENT'))) + '</div><div class="card__body">'
     + '<div class="note" style="margin-bottom:12px"><i class="fas fa-circle-info"></i> ESS 충전 사용량 = <b>ESS충전보증량 × (평일 + 토요일) × 효율(0.9)</b>. '
     + '토요일은 <b>휴일(대체)</b>로 처리되며, 충전 가동일 = 평일 + 토요일입니다.</div>'
     + '<div class="grid" style="grid-template-columns:1fr 1fr 1fr 1.2fr;gap:12px;align-items:end">'
@@ -1059,15 +1065,15 @@ PAGES.prodplan = function () {
     + '<div class="field"><label style="display:block;font-size:12px;color:var(--muted);margin-bottom:5px">충전 가동일 / 총일수</label>'
     + '<div id="pp_daysum" style="padding:9px 11px;border:1px dashed var(--border-2);border-radius:8px;text-align:right;font-weight:600;color:var(--blue-700,#1d4ed8)"></div></div>'
     + '</div>'
-    + (curIsActual ? '' : '<button class="btn" id="pp_resetdays" style="margin-top:10px"><i class="fas fa-rotate-left"></i> 일자 실적값으로 초기화</button>')
+    + (curIsActual ? '' : '<button class="btn" id="pp_resetdays" style="margin-top:10px"><i class="fas fa-rotate-left"></i> 일자 입력 초기화(비우기)</button>')
     + '</div></div>';
 
   var summary = '<div class="grid g-3" id="ppKpis" style="margin-top:16px"></div>';
 
   var tbl = '<div class="card" style="margin-top:16px"><div class="card__head"><h3>호기별 예상 생산량·가동시간 입력 <span style="font-size:12px;color:var(--muted)">(' + cur.replace('-', '.') + ')</span></h3>'
     + '<div class="grow"></div>'
-    + '<span id="pp_setbadge">' + (curIsActual ? tag('실적 확정', 'INBOUND') : (setCnt > 0 ? tag('예상값 ' + setCnt + '개 호기', 'TRANSFER') : tag('전부 실적값', 'SHIPMENT'))) + '</span>'
-    + (curIsActual ? '' : '<button class="btn" id="pp_resetmonth" style="margin-left:9px"><i class="fas fa-rotate-left"></i> 이 달 전체 실적값으로</button>')
+    + '<span id="pp_setbadge">' + (curIsActual ? tag('실적 확정', 'INBOUND') : (setCnt > 0 ? tag('예상값 ' + setCnt + '개 호기', 'TRANSFER') : tag('미입력', 'SHIPMENT'))) + '</span>'
+    + (curIsActual ? '' : '<button class="btn" id="pp_resetmonth" style="margin-left:9px"><i class="fas fa-rotate-left"></i> 이 달 입력 전체 초기화</button>')
     + '</div>'
     + '<div class="tbl-wrap" style="border:none;border-radius:0"><table class="tbl"><thead><tr>'
     + '<th>호기</th><th>항목</th><th class="num">단위</th><th class="num">실적</th><th class="num">예상 (입력)</th><th class="num">증감</th>'
@@ -1116,26 +1122,29 @@ function prodplanRenderTable() {
     }
 
     // 실적/예상 값 (표시단위)
-    var actProdDisp = ppToDisp(ln, ProdPlan.actual(cur, ln, 'prod'));
-    var actHours = ProdPlan.actual(cur, ln, 'hours');
+    // ※ 미래월(예상월)은 SAP 실적이 아직 없으므로 '실적' 값을 표시하지 않음(null 처리 → '-' 표시)
+    var hasActual = prodplanHasActual(cur);
+    var actProdDisp = hasActual ? ppToDisp(ln, ProdPlan.actual(cur, ln, 'prod')) : null;
+    var actHours = hasActual ? ProdPlan.actual(cur, ln, 'hours') : null;
     var planProdSet = ProdPlan.isSet(cur, ln, 'prod');
     var planHoursSet = ProdPlan.isSet(cur, ln, 'hours');
     var planProdDisp = planProdSet ? ppToDisp(ln, ProdPlan.rec(cur, ln).prod) : '';
     var planHoursVal = planHoursSet ? ProdPlan.rec(cur, ln).hours : '';
 
-    // 증감(생산량)
+    // 증감(생산량) — 실적이 있어야 비교 가능
     var prodDelta = (planProdSet && actProdDisp) ? ((planProdDisp - actProdDisp) / actProdDisp * 100) : null;
     var prodDeltaCell = (prodDelta != null)
       ? '<span class="tag ' + (prodDelta >= 0 ? 'tag-up' : 'tag-down') + '">' + (prodDelta >= 0 ? '+' : '') + prodDelta.toFixed(1) + '%</span>'
-      : '<span style="color:var(--muted-2);font-size:11px">실적</span>';
+      : (hasActual ? '<span style="color:var(--muted-2);font-size:11px">실적</span>' : '<span style="color:var(--muted-2);font-size:11px">예상</span>');
     // 증감(가동시간)
     var hoursDelta = (planHoursSet && actHours) ? ((planHoursVal - actHours) / actHours * 100) : null;
     var hoursDeltaCell = (hoursDelta != null)
       ? '<span class="tag ' + (hoursDelta >= 0 ? 'tag-up' : 'tag-down') + '">' + (hoursDelta >= 0 ? '+' : '') + hoursDelta.toFixed(1) + '%</span>'
       : (actHours != null ? '<span style="color:var(--muted-2);font-size:11px">실적</span>' : '<span style="color:var(--muted-2);font-size:11px">-</span>');
 
-    // 생산성(자동)
+    // 생산성(자동) — 실적 생산성은 실적이 있을 때만
     var actProductivity = (function () {
+      if (!hasActual) return null;
       var p = ProdPlan.actual(cur, ln, 'prod'), h = ProdPlan.actual(cur, ln, 'hours');
       if (p == null || h == null || h <= 0) return null;
       return ppToDisp(ln, p) / (h / 24);
@@ -1160,7 +1169,7 @@ function prodplanRenderTable() {
     html += '<tr data-line="' + ln + '">'
       + '<td>가동시간</td>'
       + '<td class="num"><span style="color:var(--muted-2);font-size:11px">Hr</span></td>'
-      + '<td class="num">' + (actHours != null ? pfmt.int(actHours) : '<span style="color:var(--muted-2);font-size:11px">N/A</span>') + '</td>'
+      + '<td class="num">' + (actHours != null ? pfmt.int(actHours) : '<span style="color:var(--muted-2);font-size:11px">' + (hasActual ? 'N/A' : '-') + '</span>') + '</td>'
       + '<td class="num"><input type="number" class="pp_in" data-line="' + ln + '" data-field="hours" value="' + (planHoursVal === '' ? '' : planHoursVal) + '" placeholder="' + (actHours != null ? pfmt.int(actHours) : '') + '"' + lockAttr + ' '
       + 'style="width:120px;padding:5px 8px;border:1px solid var(--border-2);border-radius:7px;font-family:inherit;text-align:right;font-size:12.5px' + lockStyle + '"></td>'
       + '<td class="pp-delta-hours">' + hoursDeltaCell + '</td></tr>';
@@ -1169,7 +1178,7 @@ function prodplanRenderTable() {
     var planPH = ProdPlan.get(cur, ln, 'hours');
     var actPrTip = (actProductivity != null)
       ? '실적 생산성 = 생산량 ' + pfmt.int(actProdDisp) + ' ÷ (가동시간 ' + pfmt.int(actPH) + ' ÷ 24)\n= ' + pfmt.dec(actProductivity, 1) + ' ' + unit + '/일'
-      : '실적 생산량·가동시간이 없어 계산 불가';
+      : (hasActual ? '실적 생산량·가동시간이 없어 계산 불가' : '미래월(예상)이라 실적이 없습니다 — 기준월 이전만 실적 표시');
     var planPrTip = (planProductivity != null)
       ? '예상 생산성 = 생산량 ' + pfmt.int(ppToDisp(ln, ProdPlan.get(cur, ln, 'prod'))) + ' ÷ (가동시간 ' + pfmt.int(planPH) + ' ÷ 24)\n= ' + pfmt.dec(planProductivity, 1) + ' ' + unit + '/일'
       : '예상 생산량·가동시간 입력 시 자동 계산';
@@ -1187,24 +1196,27 @@ function prodplanRenderTable() {
 
 function prodplanRenderKpis() {
   var cur = prodplanCurrentMonth();
+  var hasActual = prodplanHasActual(cur); // 미래월은 실적 없음 → 실적 대비 비교 불가
   var setCnt = PowerDB.lines.filter(function (ln) { return ProdPlan.isAnySet(cur, ln); }).length;
-  // 제지·화장지(paper) 예상 생산량 합계(톤) + 실적 대비
+  // 제지·화장지(paper) 예상 생산량 합계(톤) + 실적 대비(실적 있을 때만)
   var paperActualTon = 0, paperPlanTon = 0;
   PowerDB.lines.forEach(function (ln) {
     if (PowerDB.lineType[ln] === 'paper') {
-      var a = ProdPlan.actual(cur, ln, 'prod'); var p = ProdPlan.get(cur, ln, 'prod');
+      var a = hasActual ? ProdPlan.actual(cur, ln, 'prod') : null;
+      var p = ProdPlan.get(cur, ln, 'prod');
       paperActualTon += (a != null ? ppToDisp(ln, a) : 0);
       paperPlanTon += (p != null ? ppToDisp(ln, p) : 0);
     }
   });
   var paperDelta = paperActualTon > 0 ? ((paperPlanTon - paperActualTon) / paperActualTon * 100) : 0;
+  var deltaTxt2 = hasActual ? ((paperDelta >= 0 ? '+' : '') + paperDelta.toFixed(1) + '% vs 실적') : '미래월 · 실적 없음';
   var kp = $('#ppKpis');
   if (kp) kp.innerHTML =
     kpiCard('예상값 입력 호기', setCnt + ' / ' + PowerDB.lines.length, '개', 'fa-pen', 'ico-blue', 'delta-flat', 'fa-industry', cur.replace('-', '.') + ' 기준')
-    + kpiCard('제지·화장지 예상 생산량', pfmt.int(paperPlanTon), '톤', 'fa-weight-hanging', 'ico-indigo', (paperDelta >= 0 ? 'delta-up' : 'delta-down'), (paperDelta >= 0 ? 'fa-arrow-up' : 'fa-arrow-down'), (paperDelta >= 0 ? '+' : '') + paperDelta.toFixed(1) + '% vs 실적')
-    + kpiCard('실적 대비 변동(제지·화장지)', (paperDelta >= 0 ? '+' : '') + paperDelta.toFixed(1), '%', 'fa-chart-line', 'ico-amber', 'delta-flat', 'fa-bolt', '생산량 톤 기준');
+    + kpiCard('제지·화장지 예상 생산량', pfmt.int(paperPlanTon), '톤', 'fa-weight-hanging', 'ico-indigo', (hasActual ? (paperDelta >= 0 ? 'delta-up' : 'delta-down') : 'delta-flat'), (hasActual ? (paperDelta >= 0 ? 'fa-arrow-up' : 'fa-arrow-down') : 'fa-industry'), deltaTxt2)
+    + kpiCard('실적 대비 변동(제지·화장지)', hasActual ? ((paperDelta >= 0 ? '+' : '') + paperDelta.toFixed(1)) : '–', hasActual ? '%' : '', 'fa-chart-line', 'ico-amber', 'delta-flat', 'fa-bolt', hasActual ? '생산량 톤 기준' : '미래월은 실적이 없습니다');
   var badge = $('#pp_setbadge');
-  if (badge) badge.innerHTML = (setCnt > 0 ? tag('예상값 ' + setCnt + '개 호기', 'TRANSFER') : tag('전부 실적값', 'SHIPMENT'));
+  if (badge) badge.innerHTML = (setCnt > 0 ? tag('예상값 ' + setCnt + '개 호기', 'TRANSFER') : tag(hasActual ? '전부 실적값' : '미입력', 'SHIPMENT'));
 }
 
 function prodplanDownloadTemplate() {
@@ -1386,8 +1398,9 @@ function prodplanUpdateRow(ln) {
   var trs = $all('#ppTbody tr[data-line="' + ln + '"]');
   if (!trs.length) return;
 
-  var actProdDisp = ppToDisp(ln, ProdPlan.actual(cur, ln, 'prod'));
-  var actHours = ProdPlan.actual(cur, ln, 'hours');
+  var hasActual = prodplanHasActual(cur); // 미래월은 실적 없음
+  var actProdDisp = hasActual ? ppToDisp(ln, ProdPlan.actual(cur, ln, 'prod')) : null;
+  var actHours = hasActual ? ProdPlan.actual(cur, ln, 'hours') : null;
   var planProdSet = ProdPlan.isSet(cur, ln, 'prod');
   var planHoursSet = ProdPlan.isSet(cur, ln, 'hours');
   var planProdDisp = ppToDisp(ln, ProdPlan.get(cur, ln, 'prod'));
@@ -1398,7 +1411,7 @@ function prodplanUpdateRow(ln) {
   var c1 = trs[0] && trs[0].querySelector('.pp-delta-prod');
   if (c1) c1.innerHTML = (prodDelta != null)
     ? '<span class="tag ' + (prodDelta >= 0 ? 'tag-up' : 'tag-down') + '">' + (prodDelta >= 0 ? '+' : '') + prodDelta.toFixed(1) + '%</span>'
-    : '<span style="color:var(--muted-2);font-size:11px">실적</span>';
+    : (hasActual ? '<span style="color:var(--muted-2);font-size:11px">실적</span>' : '<span style="color:var(--muted-2);font-size:11px">예상</span>');
   // 증감 가동시간 (행2)
   var hoursDelta = (planHoursSet && actHours) ? ((planHoursVal - actHours) / actHours * 100) : null;
   var c2 = trs[1] && trs[1].querySelector('.pp-delta-hours');
