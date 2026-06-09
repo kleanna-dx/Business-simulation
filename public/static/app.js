@@ -788,7 +788,7 @@ var PnlConfig = {
   DIVS: [
     { key: 'ALL', label: '전사' },
     { key: 'PS',  label: 'PS (제지)' },
-    { key: 'HL',  label: 'HL (위생)' }
+    { key: 'HL',  label: 'HL (생활)' }
   ],
   // 사업부 ↔ 호기(라인) 매핑.  PS = 제지2·제지3,  HL = 그 외
   PS_LINES: ['제지2', '제지3'],
