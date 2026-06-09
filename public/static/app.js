@@ -17,6 +17,7 @@ var NAV = [
   { id: 'actual', icon: 'fa-table-cells', label: '실적 입력' },
   { id: 'sim', icon: 'fa-sliders', label: '사전원가 시뮬레이션', star: true },
   { id: 'power', icon: 'fa-bolt', label: '전력비 시뮬레이션', star: true },
+  { id: 'pnl', icon: 'fa-chart-line', label: '손익 시뮬레이션', star: true },
   { id: 'ai', icon: 'fa-robot', label: 'AI 분석 어시스턴트', star: true },
   { g: '승인' },
   { id: 'approval', icon: 'fa-circle-check', label: '승인 워크플로', badge: 2 }
@@ -33,6 +34,7 @@ var TITLES = {
   prodplan:  ['예상 생산량 기준정보', '호기·월별 예상 생산량 입력(또는 엑셀 업로드) → 전 시뮬레이션 공통 기준'],
   costbase:  ['전력비 기준정보', '요금 단가(기본/경·중·최대부하 등) 및 ESS 충전 일자 입력 → 전력비 산출 기준'],
   power:     ['전력비 시뮬레이션', '예상 생산량 기준정보 자동 반영 · 단가 조정 → 전력원단위·전력비 실시간 계산'],
+  pnl:       ['손익 시뮬레이션', '예상 생산량 기반 매출·원가·판관비 합산 → 월별 3개월 손익 및 톤당 손익 예측 (사업부별)'],
   ai:        ['AI 분석 어시스턴트', '자연어로 원가 차이 원인 분석'],
   approval:  ['승인 워크플로', '사전원가 확정 결재 진행 현황']
 };
@@ -775,6 +777,114 @@ var PowerRate = {
   clearMonth: function (month) { delete this.rate[month]; this.saveStorage(); }
 };
 PowerRate.loadStorage();
+
+/* ============================================================
+   손익(P&L) 시뮬레이션 — 설정/항목 정의 (PnlConfig)
+   - 사업부(PS/HL) ↔ 호기 매핑
+   - 손익 계정과목 정의(매출/변동비/고정비) — 산식 미정 항목은 입력칸으로 운영
+   ============================================================ */
+var PnlConfig = {
+  // 사업부 정의
+  DIVS: [
+    { key: 'ALL', label: '전사' },
+    { key: 'PS',  label: 'PS (제지)' },
+    { key: 'HL',  label: 'HL (위생)' }
+  ],
+  // 사업부 ↔ 호기(라인) 매핑.  PS = 제지2·제지3,  HL = 그 외
+  PS_LINES: ['제지2', '제지3'],
+  // 호기 → 사업부 키 반환
+  divOf: function (line) { return (this.PS_LINES.indexOf(line) >= 0) ? 'PS' : 'HL'; },
+  // 특정 사업부에 속한 호기 목록
+  linesOf: function (divKey) {
+    var self = this, all = (PowerDB.lines || []);
+    if (divKey === 'ALL') return all.slice();
+    if (divKey === 'PS') return all.filter(function (ln) { return self.PS_LINES.indexOf(ln) >= 0; });
+    return all.filter(function (ln) { return self.PS_LINES.indexOf(ln) < 0; }); // HL
+  },
+  // 손익 계정과목 정의
+  //  · auto : 자동 연동 항목(원재료비/전력비) — 입력 불가, 계산엔진이 채움
+  //  · input: 사용자 입력 항목 — 준변동비(고정금액 fixed + 톤당변동단가 perTon)
+  //  · kind : 'rev'(매출) | 'var'(변동비) | 'fix'(고정비)
+  ACCOUNTS: [
+    { key: 'rev_main',  label: '매출액 (판매단가 × MIX)', kind: 'rev', mode: 'input', tip: '판매단가 × 제품 MIX 비율(산식 추후) — 현재는 고정+톤당 입력' },
+    { key: 'mat',       label: '원재료비',               kind: 'var', mode: 'auto',  tip: '자재 마스터 기반 자동 계산(calc.js)' },
+    { key: 'pwr',       label: '전력비',                 kind: 'var', mode: 'auto',  tip: '전력비 시뮬레이션(호기별 전력비)에서 자동 집계' },
+    { key: 'logi',      label: '물류비',                 kind: 'var', mode: 'input', tip: '운송비 등 변동 물류비(고정+톤당)' },
+    { key: 'var_etc',   label: '기타 변동비',            kind: 'var', mode: 'input', tip: '부재료·소모품 등 기타 변동비(고정+톤당)' },
+    { key: 'labor',     label: '인건비 / 노무비',        kind: 'fix', mode: 'input', tip: '생산직·관리직 인건비(고정+톤당)' },
+    { key: 'depr',      label: '감가상각비',             kind: 'fix', mode: 'input', tip: '설비 감가상각(주로 고정)' },
+    { key: 'sga',       label: '일반관리비 / 판매비',     kind: 'fix', mode: 'input', tip: '판관비(고정+톤당)' }
+  ]
+};
+
+/* ============================================================
+   손익(P&L) 시뮬레이션 — 입력값 (PnlInput)
+   - 사업부·월·계정과목별 "고정금액(fixed)" + "톤당변동단가(perTon)" 입력 저장
+   - 자동 항목(원재료비/전력비)은 여기에 저장하지 않음(계산엔진이 산출).
+   - 현재는 localStorage(precost_pnl_input_v1). 추후 MariaDB로 이관.
+
+   [MariaDB 매핑 — 추후 연동]
+   CREATE TABLE pnl_input (
+     div_key   VARCHAR(8)  NOT NULL,   -- 'PS' | 'HL' (ALL은 PS+HL 합산이므로 저장 안 함)
+     period    DATE        NOT NULL,   -- 대상월 'YYYY-MM' → 1일
+     acct_key  VARCHAR(24) NOT NULL,   -- ACCOUNTS[].key
+     fixed     DECIMAL(20,2) NULL,     -- 고정금액 [원]
+     per_ton   DECIMAL(20,4) NULL,     -- 톤당 변동단가 [원/ton]
+     updated_by VARCHAR(64) NULL,
+     updated_at DATETIME   NULL,
+     PRIMARY KEY (div_key, period, acct_key)
+   );
+   ============================================================ */
+var PnlInput = {
+  STORAGE_KEY: 'precost_pnl_input_v1',
+  // data[divKey][month][acctKey] = { fixed?, perTon? }
+  data: {},
+  loadStorage: function () {
+    try { var raw = localStorage.getItem(this.STORAGE_KEY); this.data = raw ? JSON.parse(raw) : {}; }
+    catch (e) { this.data = {}; }
+  },
+  saveStorage: function () { try { localStorage.setItem(this.STORAGE_KEY, JSON.stringify(this.data)); } catch (e) {} },
+  // 입력 레코드 ({fixed?, perTon?} 또는 빈 객체)
+  get: function (divKey, month, acctKey) {
+    var d = this.data[divKey];
+    var m = d && d[month];
+    return (m && m[acctKey]) ? m[acctKey] : {};
+  },
+  set: function (divKey, month, acctKey, field, val) { // field: 'fixed'|'perTon'
+    if (!this.data[divKey]) this.data[divKey] = {};
+    if (!this.data[divKey][month]) this.data[divKey][month] = {};
+    if (!this.data[divKey][month][acctKey]) this.data[divKey][month][acctKey] = {};
+    var rec = this.data[divKey][month][acctKey];
+    if (val == null || val === '' || isNaN(+val)) { delete rec[field]; }
+    else { rec[field] = +val; }
+    // 빈 레코드 정리
+    if (Object.keys(rec).length === 0) delete this.data[divKey][month][acctKey];
+    if (Object.keys(this.data[divKey][month]).length === 0) delete this.data[divKey][month];
+    if (Object.keys(this.data[divKey]).length === 0) delete this.data[divKey];
+    this.saveStorage();
+  },
+  // ALL(전사)은 PS+HL 합산. 입력 항목 금액 = fixed + perTon × ton
+  amount: function (divKey, month, acctKey, tonByDiv) {
+    if (divKey === 'ALL') {
+      return this.amount('PS', month, acctKey, tonByDiv) + this.amount('HL', month, acctKey, tonByDiv);
+    }
+    var rec = this.get(divKey, month, acctKey);
+    var ton = (tonByDiv && tonByDiv[divKey] != null) ? tonByDiv[divKey] : 0;
+    var fixed = (rec.fixed != null) ? +rec.fixed : 0;
+    var perTon = (rec.perTon != null) ? +rec.perTon : 0;
+    return fixed + perTon * ton;
+  },
+  isAnySet: function () {
+    var self = this, any = false;
+    Object.keys(this.data).forEach(function (dv) {
+      Object.keys(self.data[dv]).forEach(function (mo) {
+        if (Object.keys(self.data[dv][mo]).length) any = true;
+      });
+    });
+    return any;
+  }
+};
+PnlInput.loadStorage();
 
 /* ============================================================
    예상 생산량 기준정보 — 변경 이력 (Change History)
@@ -1942,6 +2052,352 @@ AFTER.costbase = function () {
     route();
   });
   costbaseRenderDaySum();
+};
+
+/* ============================================================
+   손익(P&L) 시뮬레이션 (pnl)
+   - driver: 예상 생산량 기준정보(ProdPlan) → 매출/원가 연동
+   - 자동 항목: 원재료비(calc.js), 전력비(PowerCalc) — 사업부별 집계
+   - 입력 항목: 매출/물류비/판관비 등 → 고정금액 + 톤당변동단가 (PnlInput)
+   - 표시: 기준월 포함 forecast 3개월 + 합계 + 톤당 손익 + 사업부(전사/PS/HL)
+   ============================================================ */
+var PnlState = { div: 'ALL', startMonth: null };
+
+// 손익 대상 3개월 (기준월 포함 forecast 우선, 데이터 경계 보정)
+function pnlMonths() {
+  var months = (PowerDB.months || []).slice();
+  if (!months.length) return [];
+  var start = PnlState.startMonth || defaultMonth() || months[0];
+  var idx = months.indexOf(start);
+  if (idx < 0) idx = 0;
+  // 끝 3개월을 넘어가면 시작 인덱스를 당겨서 항상 3개 확보
+  if (idx > months.length - 3) idx = Math.max(0, months.length - 3);
+  return months.slice(idx, idx + 3);
+}
+
+// 한 사업부의 월 생산량(톤) — paper 라인 prod(kg)→ton 합산
+//  · 예상월: ProdPlan 입력값 우선 → 없으면 byMonth 예상 생산량(데모/SAP) fallback
+//  · 실적월: SAP 실적
+//  ※ 전력비 계산(powerRender)과 동일한 prod 소스를 써서 톤·전력비 일관성 유지
+function pnlDivTon(divKey, month) {
+  var lines = PnlConfig.linesOf(divKey);
+  var isActual = Period.isActual(month);
+  var rec = (PowerDB.byMonth || {})[month];
+  var ton = 0;
+  lines.forEach(function (ln) {
+    if (PowerDB.lineType[ln] !== 'paper') return; // 톤 기준은 제지/화장지(paper)군만
+    var baseKg = (rec && rec.lines && rec.lines[ln]) ? (+rec.lines[ln].prod || 0) : 0;
+    var prodKg;
+    if (isActual) {
+      prodKg = baseKg; // 실적월 — SAP 실적 고정
+    } else {
+      var p = ProdPlan.get(month, ln, 'prod'); // 예상값 입력 우선
+      prodKg = (p != null) ? +p : baseKg;      // 없으면 byMonth 예상 생산량 fallback
+    }
+    ton += prodKg / 1000;
+  });
+  return ton;
+}
+
+// 월별 사업부 톤맵 { PS:.., HL:.. }
+function pnlTonByDiv(month) {
+  return { PS: pnlDivTon('PS', month), HL: pnlDivTon('HL', month) };
+}
+
+// 한 월의 전력비를 호기별로 계산 → 사업부별 집계 { PS:원, HL:원 }
+function pnlPowerByDiv(month) {
+  var rec = (PowerDB.byMonth || {})[month];
+  var out = { PS: 0, HL: 0 };
+  if (!rec) return out;
+  // powerRender와 동일하게 예상월만 ProdPlan override 적용
+  var ov = {};
+  if (!Period.isActual(month)) {
+    PowerDB.lines.forEach(function (ln) {
+      var o = {};
+      var p = ProdPlan.get(month, ln, 'prod'); if (p != null) o.prod = p;
+      var h = ProdPlan.get(month, ln, 'hours'); if (h != null) o.hours = h;
+      ov[ln] = o;
+    });
+    var dov = ProdPlan.getDays(month);
+    if (dov) ov.days = dov;
+  }
+  var res = PowerCalc.computeMonth(rec, PowerDB.lines, PowerDB.lineType, ov, PowerDB.essOpt());
+  res.rows.forEach(function (r) {
+    out[PnlConfig.divOf(r.line)] += (r.cost || 0);
+  });
+  return out;
+}
+
+// 한 월의 원재료비 [원] (현재: 데모 자재(calc.js) 기반 총액을 사업부 톤 비율로 배분)
+//   ※ 실제 호기/제품별 자재 매핑은 추후 SAP/마스터 연동으로 정교화.
+function pnlMaterialByDiv(month) {
+  var out = { PS: 0, HL: 0 };
+  if (typeof DB === 'undefined' || !DB.materials || !DB.materials.length) return out;
+  var psT = pnlDivTon('PS', month), hlT = pnlDivTon('HL', month);
+  var totT = psT + hlT;
+  if (totT <= 0) return out;
+  // 자재 톤당 재료비(원/ton) — calc.js computeMaterial 기반(전체 자재 합산)
+  var perTonWon = DB.materials.reduce(function (s, m) {
+    var r = Calc.computeMaterial(Object.assign({}, m, { X3: totT }));
+    return s + r.W; // W: 백만원 단위
+  }, 0) * Calc.MILLION / totT; // 총재료비(원) / 총톤 = 원/ton
+  out.PS = perTonWon * psT;
+  out.HL = perTonWon * hlT;
+  return out;
+}
+
+// 한 사업부·월의 손익 계산 → { ton, rev, cost, varCost, fixCost, op, opMargin, items:{acctKey:amount} }
+function pnlComputeCell(divKey, month) {
+  var tonByDiv = pnlTonByDiv(month);
+  var ton = (divKey === 'ALL') ? (tonByDiv.PS + tonByDiv.HL) : (tonByDiv[divKey] || 0);
+
+  // 자동 항목(원재료비/전력비) — 사업부별 사전 계산
+  var matByDiv = pnlMaterialByDiv(month);
+  var pwrByDiv = pnlPowerByDiv(month);
+  function autoAmt(acctKey) {
+    var src = (acctKey === 'mat') ? matByDiv : pwrByDiv;
+    return (divKey === 'ALL') ? (src.PS + src.HL) : (src[divKey] || 0);
+  }
+
+  var items = {};
+  var rev = 0, varCost = 0, fixCost = 0;
+  PnlConfig.ACCOUNTS.forEach(function (a) {
+    var amt;
+    if (a.mode === 'auto') amt = autoAmt(a.key);
+    else amt = PnlInput.amount(divKey, month, a.key, tonByDiv);
+    items[a.key] = amt;
+    if (a.kind === 'rev') rev += amt;
+    else if (a.kind === 'var') varCost += amt;
+    else if (a.kind === 'fix') fixCost += amt;
+  });
+  var cost = varCost + fixCost;
+  var op = rev - cost;
+  var opMargin = rev > 0 ? (op / rev * 100) : null;
+  return { ton: ton, rev: rev, cost: cost, varCost: varCost, fixCost: fixCost, op: op, opMargin: opMargin, items: items };
+}
+
+PAGES.pnl = function () {
+  if (!PowerDB.hasData()) return emptyState('손익 시뮬레이션 기준 데이터가 없습니다. 운영에서는 SAP/엑셀 연동 후 생산량·원가·매출 정보가 표시됩니다.');
+
+  var months = pnlMonths();
+  var div = PnlState.div || 'ALL';
+
+  // 사업부 탭
+  var divTabs = '<div class="seg" style="display:inline-flex;gap:4px;background:var(--bg-2,#f1f5f9);padding:4px;border-radius:10px">'
+    + PnlConfig.DIVS.map(function (d) {
+        var on = d.key === div;
+        return '<button class="pnl-divtab" data-div="' + d.key + '" style="padding:7px 16px;border:none;border-radius:7px;font-family:inherit;font-size:13px;cursor:pointer;font-weight:' + (on ? '700' : '500') + ';'
+          + (on ? 'background:#fff;color:var(--blue-700,#1d4ed8);box-shadow:0 1px 3px rgba(0,0,0,.1)' : 'background:transparent;color:var(--muted,#64748b)') + '">' + d.label + '</button>';
+      }).join('')
+    + '</div>';
+
+  var startSel = '<div class="field" style="max-width:260px"><label style="display:block;font-size:12px;color:var(--muted);margin-bottom:5px">시작 월 (이후 3개월)</label>'
+    + buildYearMonthSelect('pnl', PnlState.startMonth || (months[0] || defaultMonth())) + '</div>';
+
+  var head = '<div class="card"><div class="card__head"><h3><i class="fas fa-chart-line" style="color:var(--blue);margin-right:7px"></i>손익 시뮬레이션 (P&L)</h3>'
+    + '<div class="grow"></div>' + tag('생산량 기반', 'INBOUND') + '</div><div class="card__body">'
+    + '<div class="note" style="margin-bottom:14px"><i class="fas fa-circle-info"></i> <b>예상 생산량</b>을 기준으로 매출·원가·판관비를 합산해 <b>월별 3개월 손익</b>과 <b>톤당 손익</b>을 예측합니다. '
+    + '원재료비·전력비는 <b>자동 연동</b>, 매출·물류비·판관비 등은 <b>고정금액 + 톤당단가(준변동비)</b>로 입력합니다.</div>'
+    + '<div style="display:flex;gap:16px;align-items:flex-end;flex-wrap:wrap">' + '<div>' + divTabs + '</div>' + startSel + '</div>'
+    + '</div></div>';
+
+  // KPI (3개월 합계)
+  var sum = { ton: 0, rev: 0, cost: 0, op: 0 };
+  months.forEach(function (m) {
+    var c = pnlComputeCell(div, m);
+    sum.ton += c.ton; sum.rev += c.rev; sum.cost += c.cost; sum.op += c.op;
+  });
+  var sumMargin = sum.rev > 0 ? (sum.op / sum.rev * 100) : null;
+  var kpis = '<div class="grid g-4" style="margin-top:16px">'
+    + kpiCard('3개월 매출액', pfmt.eok(sum.rev), '억원', 'fa-coins', 'ico-blue', 'delta-flat', 'fa-calendar', months.length + '개월 합계')
+    + kpiCard('3개월 총원가', pfmt.eok(sum.cost), '억원', 'fa-cubes', 'ico-indigo', 'delta-flat', 'fa-layer-group', '변동비+고정비')
+    + kpiCard('3개월 영업이익', pfmt.eok(sum.op), '억원', 'fa-sack-dollar', sum.op >= 0 ? 'ico-green' : 'ico-red',
+        sum.op >= 0 ? 'delta-up' : 'delta-down', sum.op >= 0 ? 'fa-arrow-up' : 'fa-arrow-down', sum.op >= 0 ? '흑자' : '적자')
+    + kpiCard('영업이익률', (sumMargin == null ? '-' : sumMargin.toFixed(1)), '%', 'fa-percent', 'ico-amber', 'delta-flat', 'fa-chart-pie', '3개월 평균')
+    + '</div>';
+
+  // 손익표
+  var cells = months.map(function (m) { return pnlComputeCell(div, m); });
+  var totalTon = cells.reduce(function (s, c) { return s + c.ton; }, 0);
+
+  function moH() {
+    return months.map(function (m) {
+      return '<th class="num">' + m.replace('-', '.') + '<br><span style="font-weight:400;font-size:11px;color:' + (Period.isActual(m) ? 'var(--muted-2)' : 'var(--blue)') + '">' + (Period.isActual(m) ? '실적' : '예상') + '</span></th>';
+    }).join('');
+  }
+  // 금액 행(억원 표시). perTon=true면 톤당(원/ton) 열 추가
+  function moneyRow(label, pick, opt) {
+    opt = opt || {};
+    var vals = cells.map(function (c) { return pick(c); });
+    var tot = vals.reduce(function (s, v) { return s + v; }, 0);
+    var perTon = (opt.perTon && totalTon > 0) ? (tot / totalTon) : null;
+    var cls = opt.cls || '';
+    var indent = opt.indent ? 'padding-left:22px;' : '';
+    var strong = opt.strong ? 'font-weight:700;' : '';
+    return '<tr class="' + cls + '"' + (opt.tip ? ' title="' + esc(opt.tip) + '"' : '') + '>'
+      + '<td style="' + indent + strong + '">' + label + (opt.badge ? ' ' + opt.badge : '') + '</td>'
+      + vals.map(function (v) { return '<td class="num" style="' + strong + '">' + pfmt.eok(v) + '</td>'; }).join('')
+      + '<td class="num" style="' + strong + 'background:var(--bg-2,#f8fafc)">' + pfmt.eok(tot) + '</td>'
+      + '<td class="num" style="' + strong + 'color:var(--muted)">' + (opt.noPerTon ? '-' : (perTon == null ? '-' : pfmt.won(perTon))) + '</td>'
+      + '</tr>';
+  }
+  function acctRow(a) {
+    var autoB = (a.mode === 'auto') ? '<span class="tag tag-blue" style="font-size:10px;padding:1px 6px">자동</span>' : '';
+    return moneyRow(a.label, function (c) { return c.items[a.key]; }, { indent: true, badge: autoB, perTon: true, tip: a.tip });
+  }
+  var varAccts = PnlConfig.ACCOUNTS.filter(function (a) { return a.kind === 'var'; });
+  var fixAccts = PnlConfig.ACCOUNTS.filter(function (a) { return a.kind === 'fix'; });
+  var revAccts = PnlConfig.ACCOUNTS.filter(function (a) { return a.kind === 'rev'; });
+
+  var sectionRow = function (txt) {
+    return '<tr style="background:var(--bg-2,#f1f5f9)"><td colspan="' + (months.length + 3) + '" style="font-weight:700;color:var(--muted-2);font-size:12px;letter-spacing:.3px">' + txt + '</td></tr>';
+  };
+
+  var tbl = '<div class="card" style="margin-top:16px"><div class="card__head"><h3>손익계산서 <span style="font-size:12px;color:var(--muted)">(' + PnlConfig.DIVS.filter(function (d) { return d.key === div; })[0].label + ')</span></h3>'
+    + '<div class="grow"></div>' + tag(months.length + '개월', 'INBOUND') + '</div>'
+    + '<div class="tbl-wrap" style="border:none;border-radius:0"><table class="tbl"><thead><tr>'
+    + '<th style="min-width:180px">항목</th>' + moH() + '<th class="num" style="background:var(--bg-2,#f8fafc)">합계</th><th class="num">톤당<br><span style="font-weight:400;font-size:11px;color:var(--muted-2)">[원/ton]</span></th>'
+    + '</tr></thead><tbody>'
+    // 생산량
+    + moneyRowTon()
+    // 매출
+    + revAccts.map(acctRow).join('')
+    + moneyRow('매출액 계', function (c) { return c.rev; }, { perTon: true, strong: true })
+    // 변동비
+    + sectionRow('변동비')
+    + varAccts.map(acctRow).join('')
+    + moneyRow('변동비 계', function (c) { return c.varCost; }, { perTon: true, strong: true })
+    // 고정비
+    + sectionRow('고정비 / 판관비')
+    + fixAccts.map(acctRow).join('')
+    + moneyRow('고정비 계', function (c) { return c.fixCost; }, { perTon: true, strong: true })
+    // 영업이익
+    + sectionRow('영업손익')
+    + moneyRow('영업이익', function (c) { return c.op; }, { perTon: true, strong: true, cls: 'pnl-op' })
+    + marginRow()
+    + '</tbody></table></div>'
+    + '<div class="note" style="margin:10px 14px 4px"><i class="fas fa-circle-info"></i> 금액 단위 <b>억원</b>(톤당은 원/ton). '
+    + '<span class="tag tag-blue" style="font-size:10px;padding:1px 6px">자동</span> 항목(원재료비·전력비)은 생산량 기준 자동 계산되며, '
+    + '나머지 항목은 <b><a href="#pnlinput" onclick="return false" style="color:var(--blue);cursor:default">입력값 편집</a></b> 버튼으로 입력합니다.</div>'
+    + '<div style="padding:0 14px 14px"><button class="btn btn-primary" id="pnl_editinput"><i class="fas fa-pen-to-square"></i> 손익 입력값 편집 (고정금액 + 톤당단가)</button></div>'
+    + '</div>';
+
+  // 생산량(톤) 행 — 억원 아님(톤 단위)
+  function moneyRowTon() {
+    var vals = cells.map(function (c) { return c.ton; });
+    var tot = vals.reduce(function (s, v) { return s + v; }, 0);
+    return '<tr style="font-weight:600"><td>생산량 <span style="font-weight:400;font-size:11px;color:var(--muted-2)">[톤·paper]</span></td>'
+      + vals.map(function (v) { return '<td class="num">' + pfmt.int(v) + '</td>'; }).join('')
+      + '<td class="num" style="background:var(--bg-2,#f8fafc)">' + pfmt.int(tot) + '</td>'
+      + '<td class="num" style="color:var(--muted-2)">-</td></tr>';
+  }
+  function marginRow() {
+    var vals = cells.map(function (c) { return c.opMargin; });
+    return '<tr><td style="padding-left:22px;color:var(--muted)">영업이익률 [%]</td>'
+      + vals.map(function (v) { return '<td class="num" style="color:var(--muted)">' + (v == null ? '-' : v.toFixed(1) + '%') + '</td>'; }).join('')
+      + '<td class="num" style="background:var(--bg-2,#f8fafc);color:var(--muted)">' + (sum.rev > 0 ? (cells.reduce(function (s, c) { return s + c.op; }, 0) / cells.reduce(function (s, c) { return s + c.rev; }, 0) * 100).toFixed(1) + '%' : '-') + '</td>'
+      + '<td class="num" style="color:var(--muted-2)">-</td></tr>';
+  }
+
+  return head + kpis + tbl;
+};
+
+// 손익 입력값 편집 모달 (사업부·월·항목별 고정금액/톤당단가)
+function pnlOpenInputModal() {
+  var div = PnlState.div || 'ALL';
+  var editDiv = (div === 'ALL') ? 'PS' : div; // ALL 모드면 PS부터 (사업부별 입력 필요)
+  var months = pnlMonths();
+  var inputAccts = PnlConfig.ACCOUNTS.filter(function (a) { return a.mode === 'input'; });
+
+  var divBtns = ['PS', 'HL'].map(function (dk) {
+    var lab = PnlConfig.DIVS.filter(function (d) { return d.key === dk; })[0].label;
+    var on = dk === editDiv;
+    return '<button class="pnl-mdiv" data-div="' + dk + '" style="padding:6px 14px;border:1px solid var(--border-2);border-radius:7px;font-family:inherit;cursor:pointer;font-weight:' + (on ? '700' : '500') + ';' + (on ? 'background:var(--blue,#2563eb);color:#fff;border-color:var(--blue,#2563eb)' : 'background:#fff;color:var(--muted)') + '">' + lab + '</button>';
+  }).join('');
+
+  function fld(dk, m, ak, field, ph) {
+    var rec = PnlInput.get(dk, m, ak);
+    var v = (rec[field] != null) ? rec[field] : '';
+    return '<input class="pnl-in" data-div="' + dk + '" data-month="' + m + '" data-acct="' + ak + '" data-field="' + field + '" type="text" inputmode="decimal" value="' + esc(v === '' ? '' : (+v).toLocaleString('en-US')) + '" placeholder="' + ph + '" style="width:100%;padding:6px 8px;border:1px solid var(--border-2);border-radius:6px;font-family:inherit;text-align:right;font-size:12px">';
+  }
+
+  function tableFor(dk) {
+    return '<div class="pnl-mtable" data-div="' + dk + '"' + (dk === editDiv ? '' : ' style="display:none"') + '>'
+      + '<div class="tbl-wrap" style="border:none"><table class="tbl"><thead><tr><th style="min-width:160px">항목</th>'
+      + months.map(function (m) { return '<th class="num" colspan="2">' + m.replace('-', '.') + '<br><span style="font-weight:400;font-size:10px;color:var(--muted-2)">고정[원] · 톤당[원/ton]</span></th>'; }).join('')
+      + '</tr></thead><tbody>'
+      + inputAccts.map(function (a) {
+          return '<tr><td>' + a.label + '</td>'
+            + months.map(function (m) {
+                return '<td class="num" style="padding:3px">' + fld(dk, m, a.key, 'fixed', '고정') + '</td>'
+                  + '<td class="num" style="padding:3px">' + fld(dk, m, a.key, 'perTon', '톤당') + '</td>';
+              }).join('')
+            + '</tr>';
+        }).join('')
+      + '</tbody></table></div></div>';
+  }
+
+  var html = '<div style="padding:20px 22px;max-width:min(94vw,1100px)">'
+    + '<div style="display:flex;align-items:center;margin-bottom:14px"><h3 style="margin:0;font-size:17px"><i class="fas fa-pen-to-square" style="color:var(--blue);margin-right:7px"></i>손익 입력값 편집</h3>'
+    + '<div style="flex:1"></div><button id="pnl_mclose" class="btn" style="padding:6px 10px"><i class="fas fa-xmark"></i></button></div>'
+    + '<div class="note" style="margin-bottom:12px"><i class="fas fa-circle-info"></i> 사업부·월별로 각 항목의 <b>고정금액[원]</b>과 <b>톤당 변동단가[원/ton]</b>를 입력합니다. '
+    + '금액 = 고정금액 + (톤당단가 × 해당 사업부 생산량). 입력 즉시 저장됩니다.</div>'
+    + '<div style="display:flex;gap:8px;margin-bottom:12px">' + divBtns + '</div>'
+    + tableFor('PS') + tableFor('HL')
+    + '</div>';
+  ppOpenModal(html); // 기존 모달 헬퍼 재사용
+
+  // 모달 내 이벤트
+  var ovEl = $('#pp_modal_ov');
+  if (!ovEl) return;
+  var closeBtn = $('#pnl_mclose');
+  if (closeBtn) closeBtn.addEventListener('click', ppCloseModal);
+  // 사업부 전환
+  $all('.pnl-mdiv').forEach(function (b) {
+    b.addEventListener('click', function () {
+      var dk = b.getAttribute('data-div');
+      $all('.pnl-mdiv').forEach(function (x) {
+        var on = x === b;
+        x.style.fontWeight = on ? '700' : '500';
+        x.style.background = on ? 'var(--blue,#2563eb)' : '#fff';
+        x.style.color = on ? '#fff' : 'var(--muted)';
+        x.style.borderColor = on ? 'var(--blue,#2563eb)' : 'var(--border-2)';
+      });
+      $all('.pnl-mtable').forEach(function (t) { t.style.display = (t.getAttribute('data-div') === dk) ? '' : 'none'; });
+    });
+  });
+  // 입력
+  $all('.pnl-in').forEach(function (inp) {
+    inp.addEventListener('input', function () {
+      var cleaned = inp.value.replace(/[^\d.,-]/g, '');
+      if (cleaned !== inp.value) inp.value = cleaned;
+      var n = (inp.value === '') ? null : +inp.value.replace(/,/g, '');
+      PnlInput.set(inp.getAttribute('data-div'), inp.getAttribute('data-month'), inp.getAttribute('data-acct'), inp.getAttribute('data-field'), (n == null || isNaN(n)) ? null : n);
+    });
+    inp.addEventListener('focusout', function () {
+      if (inp.value !== '') { var n = +inp.value.replace(/,/g, ''); if (!isNaN(n)) inp.value = n.toLocaleString('en-US'); }
+    });
+  });
+}
+
+AFTER.pnl = function () {
+  if (!PowerDB.hasData()) return;
+  // 사업부 탭
+  $all('.pnl-divtab').forEach(function (b) {
+    b.addEventListener('click', function () { PnlState.div = b.getAttribute('data-div'); route(); });
+  });
+  // 시작 월 선택
+  var ys = $('#pnl_year');
+  if (ys) ys.addEventListener('change', function () {
+    var prefNum = (PnlState.startMonth || defaultMonth() || '').split('-')[1];
+    var target = refreshMonthOptions('pnl', prefNum);
+    if (target) { PnlState.startMonth = target; route(); }
+  });
+  var ms = $('#pnl_month');
+  if (ms) ms.addEventListener('change', function () { PnlState.startMonth = ms.value; route(); });
+  // 입력값 편집 모달
+  var edit = $('#pnl_editinput');
+  if (edit) edit.addEventListener('click', pnlOpenInputModal);
 };
 
 /* ====================== AI 분석 어시스턴트 (slide 9) ====================== */
